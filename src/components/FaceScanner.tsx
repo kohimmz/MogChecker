@@ -1,18 +1,32 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import * as faceapi from '@vladmandic/face-api';
 import { ScanDirection } from '../types';
-import { Camera, RefreshCw, Upload, Sparkles, Check, AlertCircle, ArrowLeft } from 'lucide-react';
+import { estimateHeadPose, HeadPose } from '../utils/faceLandmarkAnalyzer';
+import {
+  Camera,
+  Upload,
+  AlertCircle,
+  ArrowLeft,
+  CheckCircle,
+  Loader2,
+  HelpCircle
+} from 'lucide-react';
 
 interface FaceScannerProps {
-  onScanComplete: (capturedPhoto?: string) => void;
+  onScanComplete: (
+    landmarks: faceapi.FaceLandmarks68,
+    photo?: string,
+    canvas?: HTMLCanvasElement
+  ) => void;
   onBack: () => void;
 }
 
-const STAGES: Array<{ id: ScanDirection; title: string; instruction: string }> = [
-  { id: 'center', title: 'Центр', instruction: 'Смотрите прямо в центр круга' },
-  { id: 'left', title: 'Влево', instruction: 'Медленно поверните голову влево' },
-  { id: 'right', title: 'Вправо', instruction: 'Медленно поверните голову вправо' },
-  { id: 'up', title: 'Вверх', instruction: 'Слегка приподнимите подбородок вверх' },
-  { id: 'down', title: 'Вниз', instruction: 'Слегка опустите подбородок вниз' },
+const STAGES: Array<{ id: ScanDirection; title: string; instruction: string; hint: string }> = [
+  { id: 'center', title: 'Центр', instruction: 'Смотрите прямо в центр круга', hint: 'Удерживайте нейтральный взгляд' },
+  { id: 'left', title: 'Влево', instruction: 'Поверните голову влево', hint: 'Плавный поворот головы налево' },
+  { id: 'right', title: 'Вправо', instruction: 'Поверните голову вправо', hint: 'Плавный поворот головы направо' },
+  { id: 'up', title: 'Вверх', instruction: 'Приподнимите подбородок вверх', hint: 'Слегка наклоните голову назад' },
+  { id: 'down', title: 'Вниз', instruction: 'Опустите подбородок вниз', hint: 'Слегка наклоните голову вперед' },
 ];
 
 const TOTAL_TICKS = 48;
@@ -22,25 +36,62 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [modelLoadingError, setModelLoadingError] = useState<string | null>(null);
   const [currentStageIndex, setCurrentStageIndex] = useState(0);
   const [completedStages, setCompletedStages] = useState<ScanDirection[]>([]);
-  const [hasCamera, setHasCamera] = useState<boolean | null>(null);
+  const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
-  const [faceDetected, setFaceDetected] = useState(true);
-  const [isSimulating, setIsSimulating] = useState(false);
+  
+  // Real Head Pose State
+  const [headPose, setHeadPose] = useState<HeadPose | null>(null);
+  const [faceDetected, setFaceDetected] = useState(false);
   const [capturedPhoto, setCapturedPhoto] = useState<string | undefined>();
-  const [scanProgress, setScanProgress] = useState(0); // 0 to 100
+  const [calibratedLandmarks, setCalibratedLandmarks] = useState<faceapi.FaceLandmarks68 | null>(null);
+
+  // Success hold timers
+  const poseHoldCounter = useRef(0);
+  const isTransitioning = useRef(false);
 
   const currentStage = STAGES[currentStageIndex];
+  const scanProgress = ((completedStages.length) / STAGES.length) * 100;
 
-  // Initialize Camera
+  // 1. Load Real Models from public/models
   useEffect(() => {
-    let active = true;
+    let isMounted = true;
 
-    async function initCamera() {
+    async function loadModels() {
+      try {
+        const MODEL_URL = '/models';
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+        ]);
+        if (isMounted) {
+          setModelsLoaded(true);
+        }
+      } catch (err: any) {
+        console.error('Failed to load face-api models:', err);
+        if (isMounted) {
+          setModelLoadingError('Не удалось загрузить локальную модель распознавания лица.');
+        }
+      }
+    }
+
+    loadModels();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // 2. Start Front Camera
+  useEffect(() => {
+    let isMounted = true;
+
+    async function startCamera() {
       try {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          throw new Error('Камера недоступна в этом браузере/окружении');
+          throw new Error('Камера недоступна в этой среде');
         }
 
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -52,7 +103,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
           audio: false,
         });
 
-        if (!active) {
+        if (!isMounted) {
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
@@ -60,185 +111,286 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(() => {});
+          videoRef.current.onloadedmetadata = () => {
+            videoRef.current?.play().catch(() => {});
+            setCameraActive(true);
+          };
         }
-        setHasCamera(true);
       } catch (err: any) {
-        console.warn('Camera init failed or permission denied:', err);
-        if (active) {
-          setHasCamera(false);
-          setCameraError('Доступ к фронтальной камере не предоставлен. Вы можете продолжить в режиме симуляции или загрузить фото.');
+        console.warn('Camera error:', err);
+        if (isMounted) {
+          setCameraActive(false);
+          setCameraError('Доступ к фронтальной камере ограничен. Разрешите доступ или загрузите снимок из галереи.');
         }
       }
     }
 
-    initCamera();
+    if (modelsLoaded) {
+      startCamera();
+    }
 
     return () => {
-      active = false;
+      isMounted = false;
       if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, []);
+  }, [modelsLoaded]);
 
-  // Complete Stage transition
-  const handleStageComplete = useCallback(() => {
-    const stageId = STAGES[currentStageIndex].id;
-    if (!completedStages.includes(stageId)) {
-      setCompletedStages((prev) => [...prev, stageId]);
+  // Stage Advancement Handler
+  const advanceToNextStage = useCallback((landmarks: faceapi.FaceLandmarks68) => {
+    if (isTransitioning.current) return;
+    isTransitioning.current = true;
+
+    // Haptic feedback if available on device
+    if (typeof navigator !== 'undefined' && navigator.vibrate) {
+      try { navigator.vibrate(60); } catch (e) {}
     }
 
-    // Capture snapshot on center stage
+    const stageId = STAGES[currentStageIndex].id;
+    setCompletedStages((prev) => (prev.includes(stageId) ? prev : [...prev, stageId]));
+
+    // Capture calibrated center snapshot
     if (currentStageIndex === 0 && videoRef.current) {
       try {
         const offCanvas = document.createElement('canvas');
-        offCanvas.width = 300;
-        offCanvas.height = 300;
+        offCanvas.width = 320;
+        offCanvas.height = 320;
         const ctx = offCanvas.getContext('2d');
         if (ctx) {
-          ctx.drawImage(videoRef.current, 0, 0, 300, 300);
-          setCapturedPhoto(offCanvas.toDataURL('image/jpeg', 0.8));
+          ctx.drawImage(videoRef.current, 0, 0, 320, 320);
+          const dataUrl = offCanvas.toDataURL('image/jpeg', 0.85);
+          setCapturedPhoto(dataUrl);
         }
-      } catch (e) {
-        // ignore canvas capture error
-      }
+      } catch (e) {}
     }
+
+    setCalibratedLandmarks(landmarks);
 
     if (currentStageIndex < STAGES.length - 1) {
       setCurrentStageIndex((prev) => prev + 1);
-      setScanProgress(((currentStageIndex + 1) / STAGES.length) * 100);
-    } else {
-      setScanProgress(100);
+      poseHoldCounter.current = 0;
       setTimeout(() => {
-        onScanComplete(capturedPhoto);
-      }, 700);
+        isTransitioning.current = false;
+      }, 400);
+    } else {
+      // Completed all 5 angles!
+      setTimeout(() => {
+        onScanComplete(landmarks, capturedPhoto, canvasRef.current || undefined);
+      }, 500);
     }
-  }, [currentStageIndex, completedStages, capturedPhoto, onScanComplete]);
+  }, [currentStageIndex, capturedPhoto, onScanComplete]);
 
-  // Automated or interactive angle progress loop
+  // 3. Real Computer Vision Loop
   useEffect(() => {
-    const timer = setTimeout(() => {
-      handleStageComplete();
-    }, 2800);
+    if (!modelsLoaded || !cameraActive) return;
 
-    return () => clearTimeout(timer);
-  }, [currentStageIndex, handleStageComplete]);
-
-  // Animated Mesh Overlay on Canvas
-  useEffect(() => {
     let animId: number;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+    let isProcessing = false;
 
-    let angle = 0;
+    const processFrame = async () => {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
 
-    const render = () => {
-      angle += 0.04;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!video || !canvas || video.paused || video.ended || video.readyState < 2) {
+        animId = requestAnimationFrame(processFrame);
+        return;
+      }
 
-      const cx = canvas.width / 2;
-      const cy = canvas.height / 2;
+      if (isProcessing) {
+        animId = requestAnimationFrame(processFrame);
+        return;
+      }
 
-      // Coordinate shift based on current target stage
-      let targetX = 0;
-      let targetY = 0;
-      if (currentStage.id === 'left') targetX = -18;
-      if (currentStage.id === 'right') targetX = 18;
-      if (currentStage.id === 'up') targetY = -15;
-      if (currentStage.id === 'down') targetY = 15;
+      isProcessing = true;
 
-      const shiftX = Math.sin(angle) * 4 + targetX;
-      const shiftY = Math.cos(angle * 1.2) * 3 + targetY;
+      try {
+        // Run real face detection with 68 landmarks
+        const detection = await faceapi
+          .detectSingleFace(
+            video,
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.35 })
+          )
+          .withFaceLandmarks(false);
 
-      // Draw Face Wireframe Points
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-      ctx.lineWidth = 1;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-      // Jawline curve
-      const jawPoints = [
-        [-55, -20], [-50, 15], [-35, 45], [-18, 62], [0, 68],
-        [18, 62], [35, 45], [50, 15], [55, -20]
-      ];
+          if (detection) {
+            setFaceDetected(true);
+            const dims = { width: canvas.width, height: canvas.height };
+            const resizedDetection = faceapi.resizeResults(detection, dims);
+            const landmarks = resizedDetection.landmarks;
 
-      // Draw jawline path
-      ctx.beginPath();
-      jawPoints.forEach(([x, y], idx) => {
-        const px = cx + x + shiftX;
-        const py = cy + y + shiftY;
-        if (idx === 0) ctx.moveTo(px, py);
-        else ctx.lineTo(px, py);
-      });
-      ctx.stroke();
+            // Draw Real 68 Facial Landmark Mesh
+            drawRealFaceMesh(ctx, landmarks);
 
-      // Eyebrows & Eyes
-      const eyePoints = [
-        // Left eye
-        [-32, -18], [-22, -22], [-14, -18], [-22, -14],
-        // Right eye
-        [14, -18], [22, -22], [32, -18], [22, -14],
-        // Eyebrow points
-        [-35, -30], [-22, -34], [-12, -30],
-        [12, -30], [22, -34], [35, -30],
-        // Nose bridge & tip
-        [0, -15], [0, 2], [-8, 14], [0, 16], [8, 14],
-        // Mouth
-        [-18, 36], [0, 32], [18, 36], [0, 42],
-        // Hairline boundary
-        [-45, -55], [-20, -70], [0, -72], [20, -70], [45, -55]
-      ];
+            // Compute Real Head Pose (Yaw, Pitch, Roll)
+            const pose = estimateHeadPose(landmarks, true);
+            setHeadPose(pose);
 
-      // Draw connecting lines for eyes and nose
-      eyePoints.forEach(([x, y]) => {
-        const px = cx + x + shiftX;
-        const py = cy + y + shiftY;
-        ctx.beginPath();
-        ctx.arc(px, py, 1.8, 0, Math.PI * 2);
-        ctx.fill();
-      });
+            // Verify Current Stage Condition
+            let isCurrentPoseMatched = false;
+            if (currentStage.id === 'center') {
+              isCurrentPoseMatched = pose.isCenter;
+            } else if (currentStage.id === 'left') {
+              isCurrentPoseMatched = pose.isLeft;
+            } else if (currentStage.id === 'right') {
+              isCurrentPoseMatched = pose.isRight;
+            } else if (currentStage.id === 'up') {
+              isCurrentPoseMatched = pose.isUp;
+            } else if (currentStage.id === 'down') {
+              isCurrentPoseMatched = pose.isDown;
+            }
 
-      // Crosshair center scanner line
-      const scanLineY = cy + Math.sin(angle * 2) * 60;
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
-      ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      ctx.moveTo(cx - 50, scanLineY);
-      ctx.lineTo(cx + 50, scanLineY);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      animId = requestAnimationFrame(render);
+            if (isCurrentPoseMatched && !isTransitioning.current) {
+              poseHoldCounter.current += 1;
+              // Hold for ~4 frames (~200ms) to confirm intentional head turn
+              if (poseHoldCounter.current >= 4) {
+                advanceToNextStage(landmarks);
+              }
+            } else {
+              poseHoldCounter.current = Math.max(0, poseHoldCounter.current - 1);
+            }
+          } else {
+            setFaceDetected(false);
+            setHeadPose(null);
+            poseHoldCounter.current = 0;
+          }
+        }
+      } catch (err) {
+        // frame processing non-fatal error
+      } finally {
+        isProcessing = false;
+        animId = requestAnimationFrame(processFrame);
+      }
     };
 
-    render();
+    animId = requestAnimationFrame(processFrame);
 
-    return () => cancelAnimationFrame(animId);
-  }, [currentStage]);
+    return () => {
+      cancelAnimationFrame(animId);
+    };
+  }, [modelsLoaded, cameraActive, currentStage, advanceToNextStage]);
 
-  // File Upload fallback
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Draw 68 Real Points & Connecting Lines
+  const drawRealFaceMesh = (ctx: CanvasRenderingContext2D, landmarks: faceapi.FaceLandmarks68) => {
+    const pts = landmarks.positions;
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+    ctx.lineWidth = 1.2;
+    ctx.fillStyle = '#ffffff';
+
+    // Jawline: points 0 - 16
+    ctx.beginPath();
+    for (let i = 0; i <= 16; i++) {
+      if (i === 0) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+
+    // Right Eyebrow: 17 - 21
+    ctx.beginPath();
+    for (let i = 17; i <= 21; i++) {
+      if (i === 17) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+
+    // Left Eyebrow: 22 - 26
+    ctx.beginPath();
+    for (let i = 22; i <= 26; i++) {
+      if (i === 22) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+
+    // Nose Bridge: 27 - 30 & Nose Tip: 31 - 35
+    ctx.beginPath();
+    for (let i = 27; i <= 30; i++) {
+      if (i === 27) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.stroke();
+
+    ctx.beginPath();
+    for (let i = 31; i <= 35; i++) {
+      if (i === 31) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // Right Eye: 36 - 41
+    ctx.beginPath();
+    for (let i = 36; i <= 41; i++) {
+      if (i === 36) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // Left Eye: 42 - 47
+    ctx.beginPath();
+    for (let i = 42; i <= 47; i++) {
+      if (i === 42) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // Lips: 48 - 67
+    ctx.beginPath();
+    for (let i = 48; i <= 59; i++) {
+      if (i === 48) ctx.moveTo(pts[i].x, pts[i].y);
+      else ctx.lineTo(pts[i].x, pts[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // Draw prominent landmark dots
+    const keyIndices = [36, 39, 42, 45, 30, 8, 48, 54, 19, 24, 4, 12];
+    keyIndices.forEach((idx) => {
+      ctx.beginPath();
+      ctx.arc(pts[idx].x, pts[idx].y, 2.2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  };
+
+  // 4. File Upload with Real Landmark Detection
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (event) => {
-        const result = event.target?.result as string;
-        setCapturedPhoto(result);
-        setScanProgress(100);
-        setTimeout(() => {
-          onScanComplete(result);
-        }, 500);
-      };
-      reader.readAsDataURL(file);
+    if (!file) return;
+
+    try {
+      const img = await faceapi.bufferToImage(file);
+      const detection = await faceapi
+        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
+        .withFaceLandmarks(false);
+
+      if (detection) {
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = img.width;
+        offCanvas.height = img.height;
+        const ctx = offCanvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0);
+
+        setCapturedPhoto(offCanvas.toDataURL('image/jpeg', 0.85));
+        onScanComplete(detection.landmarks, offCanvas.toDataURL('image/jpeg', 0.85), offCanvas);
+      } else {
+        alert('Лицо на фото не обнаружено. Пожалуйста, выберите четкое фронтальное фото.');
+      }
+    } catch (err) {
+      console.error('File detection error:', err);
+      alert('Ошибка обработки изображения.');
     }
   };
 
-  // Render ticks for circular Face ID ring (Apple Face ID style from reference)
+  // Render Apple Face ID circular ticks
   const renderTicks = () => {
     const ticks = [];
-    const radius = 135; // outer circle radius
+    const radius = 135;
     const tickLength = 10;
     const progressTicks = Math.round((scanProgress / 100) * TOTAL_TICKS);
 
@@ -282,20 +434,23 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
         </button>
 
         <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-xs font-mono text-zinc-300">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          <span>FACE ID CALIBRATION</span>
+          <span
+            className={`w-2 h-2 rounded-full ${
+              faceDetected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+            }`}
+          />
+          <span>{faceDetected ? 'ЛИЦО ЗАХВАЧЕНО' : 'ПОИСК ЛИЦА...'}</span>
         </div>
 
-        <div className="text-xs font-mono text-zinc-500">
+        <div className="text-xs font-mono text-zinc-400">
           {currentStageIndex + 1}/{STAGES.length}
         </div>
       </div>
 
-      {/* Main Face ID Circular Viewport */}
+      {/* Main Face ID Viewport */}
       <div className="my-auto flex flex-col items-center justify-center relative">
-        {/* Apple Face ID Circular Scanner Assembly */}
         <div className="relative w-[300px] h-[300px] flex items-center justify-center">
-          {/* SVG Radial Ticks Ring */}
+          {/* Radial Ticks Ring */}
           <svg
             className="absolute inset-0 w-full h-full pointer-events-none z-20"
             viewBox="0 0 300 300"
@@ -305,7 +460,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
 
           {/* Camera Viewport (Circular cut) */}
           <div className="relative w-[236px] h-[236px] rounded-full overflow-hidden bg-zinc-950 border border-zinc-800 shadow-2xl flex items-center justify-center z-10">
-            {hasCamera ? (
+            {cameraActive ? (
               <video
                 ref={videoRef}
                 autoPlay
@@ -314,18 +469,22 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
                 className="w-full h-full object-cover -scale-x-100"
               />
             ) : (
-              /* High-tech stylized simulation head placeholder when camera is unavailable */
-              <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-900 text-zinc-500 relative">
-                <div className="w-24 h-32 rounded-full border border-zinc-700/60 flex items-center justify-center">
-                  <div className="w-16 h-20 rounded-full border border-zinc-800 flex items-center justify-center">
-                    <Sparkles className="w-6 h-6 text-zinc-400 animate-pulse" />
-                  </div>
-                </div>
-                <span className="text-[10px] font-mono text-zinc-400 mt-2">РЕЖИМ СИМУЛЯЦИИ</span>
+              <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-900 text-zinc-500 p-4 text-center">
+                {!modelsLoaded ? (
+                  <>
+                    <Loader2 className="w-8 h-8 text-white animate-spin mb-2" />
+                    <span className="text-xs font-mono text-zinc-300">Загрузка AI моделей...</span>
+                  </>
+                ) : (
+                  <>
+                    <Camera className="w-8 h-8 text-zinc-400 mb-2" />
+                    <span className="text-xs font-mono text-zinc-400">Ожидание камеры</span>
+                  </>
+                )}
               </div>
             )}
 
-            {/* Canvas Facial Landmark Mesh Overlay */}
+            {/* Real Landmark Overlay Canvas */}
             <canvas
               ref={canvasRef}
               width={236}
@@ -334,25 +493,33 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
             />
           </div>
 
-          {/* Glowing Ambient Halo */}
+          {/* Halo */}
           <div className="absolute inset-0 rounded-full bg-white/5 blur-2xl pointer-events-none" />
         </div>
 
-        {/* Step Instructions (Apple Face ID style) */}
-        <div className="mt-8 text-center max-w-xs">
+        {/* Real-Time Angle / Pose Metrics Bar */}
+        {headPose && (
+          <div className="mt-4 px-3 py-1 rounded-full bg-zinc-900/90 border border-zinc-800 text-[11px] font-mono text-zinc-400 flex items-center gap-3">
+            <span>Поворот (Yaw): <strong className="text-white">{headPose.yaw > 0 ? `+${headPose.yaw}` : headPose.yaw}°</strong></span>
+            <span>Наклон (Pitch): <strong className="text-white">{headPose.pitch > 0 ? `+${headPose.pitch}` : headPose.pitch}°</strong></span>
+          </div>
+        )}
+
+        {/* Step Instructions */}
+        <div className="mt-5 text-center max-w-xs">
           <div className="inline-block px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-[11px] font-mono uppercase tracking-widest text-zinc-400 mb-2">
-            ЭТАП: {currentStage.title}
+            ЭТАП {currentStageIndex + 1}: {currentStage.title}
           </div>
           <h3 className="text-lg sm:text-xl font-bold text-white tracking-tight mb-1">
             {currentStage.instruction}
           </h3>
           <p className="text-xs text-zinc-400">
-            Сохраняйте лицо в поле зрения для фиксации 100+ ключевых точек
+            {currentStage.hint}
           </p>
         </div>
 
         {/* Stages Progress Dots */}
-        <div className="flex items-center gap-2 mt-5">
+        <div className="flex items-center gap-2 mt-4">
           {STAGES.map((stg, idx) => {
             const isDone = completedStages.includes(stg.id);
             const isCurr = currentStageIndex === idx;
@@ -373,20 +540,20 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
         </div>
       </div>
 
-      {/* Camera Error or Action Controls */}
-      <div className="pt-2 flex flex-col gap-3">
+      {/* Footer Controls */}
+      <div className="pt-2 flex flex-col gap-2.5">
         {cameraError && (
-          <div className="p-3 rounded-xl bg-zinc-900/90 border border-zinc-800 flex items-start gap-2.5 text-xs text-zinc-400 mb-1">
+          <div className="p-3 rounded-xl bg-zinc-900/90 border border-zinc-800 flex items-start gap-2.5 text-xs text-zinc-400">
             <AlertCircle className="w-4 h-4 text-zinc-300 shrink-0 mt-0.5" />
             <span>{cameraError}</span>
           </div>
         )}
 
         <div className="flex items-center gap-2">
-          {/* Upload photo button */}
+          {/* Real Photo Upload Fallback */}
           <label className="flex-1 py-3 px-3 rounded-xl font-mono text-xs tracking-wide bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition-colors flex items-center justify-center gap-2 cursor-pointer uppercase">
             <Upload className="w-3.5 h-3.5" />
-            <span>Загрузить фото</span>
+            <span>Анализ фото из галереи</span>
             <input
               type="file"
               accept="image/*"
@@ -395,18 +562,20 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
             />
           </label>
 
-          {/* Next Stage button (manual trigger if user prefers fast scan) */}
-          <button
-            onClick={handleStageComplete}
-            className="flex-1 py-3 px-3 rounded-xl font-mono text-xs tracking-wide bg-white text-black hover:bg-zinc-200 transition-colors flex items-center justify-center gap-2 uppercase font-bold"
-          >
-            <Check className="w-3.5 h-3.5" />
-            <span>{currentStageIndex === STAGES.length - 1 ? 'Завершить' : 'Далее'}</span>
-          </button>
+          {/* Calibrate / Skip manually if user is stuck */}
+          {calibratedLandmarks && (
+            <button
+              onClick={() => advanceToNextStage(calibratedLandmarks)}
+              className="py-3 px-4 rounded-xl font-mono text-xs bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 uppercase"
+              title="Зафиксировать текущий ракурс"
+            >
+              Фикс
+            </button>
+          )}
         </div>
 
         <div className="text-center text-[10px] text-zinc-600 font-mono">
-          КАДРЫ НЕ ПОКИДАЮТ ПАМЯТЬ ТЕЛЕФОНА • 0KB ПЕРЕДАНО В СЕТЬ
+          НЕЙРОСЕТЬ ВЫЧИСЛЯЕТ РЕАЛЬНЫЕ УГЛЫ НА ВАШЕМ УСТРОЙСТВЕ
         </div>
       </div>
     </div>

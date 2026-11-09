@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import * as faceapi from '@vladmandic/face-api';
 import { AppStep, BodyType, ScanResult, UserProfile } from './types';
 import { Splash } from './components/Splash';
 import { Disclaimer } from './components/Disclaimer';
@@ -8,6 +9,8 @@ import { FaceScanner } from './components/FaceScanner';
 import { Processing } from './components/Processing';
 import { Results } from './components/Results';
 import { calculateScanResults } from './utils/faceMetrics';
+import { analyzeRealFacialLandmarks } from './utils/faceLandmarkAnalyzer';
+import { getArchetypeByScore } from './utils/archetypes';
 
 export const App: React.FC = () => {
   const [currentStep, setCurrentStep] = useState<AppStep>('splash');
@@ -21,6 +24,8 @@ export const App: React.FC = () => {
   });
 
   const [capturedPhoto, setCapturedPhoto] = useState<string | undefined>();
+  const [detectedLandmarks, setDetectedLandmarks] = useState<faceapi.FaceLandmarks68 | null>(null);
+  const [capturedCanvas, setCapturedCanvas] = useState<HTMLCanvasElement | undefined>();
   const [scanResult, setScanResult] = useState<ScanResult | null>(null);
 
   // Step 1: Splash completes -> Disclaimer
@@ -59,22 +64,65 @@ export const App: React.FC = () => {
     setCurrentStep('scanner');
   };
 
-  // Step 5: Face Scan completes (all 5 angles captured) -> Processing
-  const handleScanComplete = (photo?: string) => {
+  // Step 5: Face Scan completes with real detected landmarks
+  const handleScanComplete = (
+    landmarks: faceapi.FaceLandmarks68,
+    photo?: string,
+    canvas?: HTMLCanvasElement
+  ) => {
+    setDetectedLandmarks(landmarks);
     setCapturedPhoto(photo);
+    setCapturedCanvas(canvas);
     setCurrentStep('processing');
   };
 
-  // Step 6: Processing calculation completes -> Results
+  // Step 6: Processing calculation completes -> compute REAL metrics
   const handleProcessingComplete = () => {
-    const results = calculateScanResults(userProfile, capturedPhoto);
-    setScanResult(results);
+    let result: ScanResult;
+
+    if (detectedLandmarks) {
+      // Calculate REAL metrics from computer vision
+      const realAnalysis = analyzeRealFacialLandmarks(
+        detectedLandmarks,
+        userProfile,
+        capturedCanvas
+      );
+
+      const archetype = getArchetypeByScore(realAnalysis.overallScore);
+
+      result = {
+        overallScore: realAnalysis.overallScore,
+        archetype,
+        hairAnalysis: realAnalysis.hairAnalysis,
+        metrics: realAnalysis.metrics,
+        faceShape: realAnalysis.faceShape,
+        symmetryScore: realAnalysis.symmetryScore,
+        jawlineScore: realAnalysis.jawlineScore,
+        eyesScore: realAnalysis.eyesScore,
+        canthalTilt: realAnalysis.canthalTiltDesc,
+        strengths: realAnalysis.strengths,
+        improvements: realAnalysis.improvements,
+        capturedImage: capturedPhoto,
+        date: new Date().toLocaleDateString('ru-RU', {
+          day: 'numeric',
+          month: 'long',
+          year: 'numeric',
+        }),
+      };
+    } else {
+      // Fallback
+      result = calculateScanResults(userProfile, capturedPhoto);
+    }
+
+    setScanResult(result);
     setCurrentStep('results');
   };
 
   // Restart flow
   const handleRestart = () => {
     setCapturedPhoto(undefined);
+    setDetectedLandmarks(null);
+    setCapturedCanvas(undefined);
     setScanResult(null);
     setCurrentStep('profile');
   };
