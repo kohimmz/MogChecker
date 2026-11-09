@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ScanResult, UserProfile } from '../types';
 import { ARCHETYPES } from '../utils/archetypes';
+import { PhotoFlawInspector } from './PhotoFlawInspector';
 import {
   Award,
   Scissors,
@@ -14,7 +15,9 @@ import {
   Info,
   ShieldCheck,
   Eye,
-  Sliders
+  Sliders,
+  AlertTriangle,
+  ChevronRight
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
@@ -25,7 +28,7 @@ interface ResultsProps {
 }
 
 export const Results: React.FC<ResultsProps> = ({ result, profile, onRestart }) => {
-  const [activeTab, setActiveTab] = useState<'overview' | 'metrics' | 'hair' | 'plan'>('overview');
+  const [activeTab, setActiveTab] = useState<'flaws' | 'overview' | 'metrics' | 'hair' | 'plan'>('flaws');
   const [expandedCategory, setExpandedCategory] = useState<string | null>('Золотое сечение и трети');
   const [showTierList, setShowTierList] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -215,10 +218,33 @@ export const Results: React.FC<ResultsProps> = ({ result, profile, onRestart }) 
         </div>
 
         {/* Tab Navigation */}
-        <div className="flex rounded-2xl bg-zinc-950 p-1 border border-zinc-800 text-xs font-mono">
+        <div className="grid grid-cols-5 rounded-2xl bg-zinc-950 p-1 border border-zinc-800 text-[10px] sm:text-xs font-mono gap-1">
+          <button
+            onClick={() => setActiveTab('flaws')}
+            className={`py-2 rounded-xl font-medium transition-all flex flex-col items-center justify-center gap-0.5 ${
+              activeTab === 'flaws'
+                ? 'bg-white text-black font-bold shadow-md'
+                : 'text-zinc-400 hover:text-white'
+            }`}
+          >
+            <span className="flex items-center gap-1">
+              Дефекты
+              {result.flaws && result.flaws.length > 0 && (
+                <span
+                  className={`w-4 h-4 rounded-full text-[9px] flex items-center justify-center font-bold ${
+                    activeTab === 'flaws'
+                      ? 'bg-red-500 text-white'
+                      : 'bg-zinc-800 text-red-400'
+                  }`}
+                >
+                  {result.flaws.length}
+                </span>
+              )}
+            </span>
+          </button>
           <button
             onClick={() => setActiveTab('overview')}
-            className={`flex-1 py-2.5 rounded-xl font-medium transition-all ${
+            className={`py-2 rounded-xl font-medium transition-all ${
               activeTab === 'overview'
                 ? 'bg-white text-black font-bold shadow-md'
                 : 'text-zinc-400 hover:text-white'
@@ -228,7 +254,7 @@ export const Results: React.FC<ResultsProps> = ({ result, profile, onRestart }) 
           </button>
           <button
             onClick={() => setActiveTab('hair')}
-            className={`flex-1 py-2.5 rounded-xl font-medium transition-all ${
+            className={`py-2 rounded-xl font-medium transition-all ${
               activeTab === 'hair'
                 ? 'bg-white text-black font-bold shadow-md'
                 : 'text-zinc-400 hover:text-white'
@@ -238,7 +264,7 @@ export const Results: React.FC<ResultsProps> = ({ result, profile, onRestart }) 
           </button>
           <button
             onClick={() => setActiveTab('metrics')}
-            className={`flex-1 py-2.5 rounded-xl font-medium transition-all ${
+            className={`py-2 rounded-xl font-medium transition-all ${
               activeTab === 'metrics'
                 ? 'bg-white text-black font-bold shadow-md'
                 : 'text-zinc-400 hover:text-white'
@@ -248,7 +274,7 @@ export const Results: React.FC<ResultsProps> = ({ result, profile, onRestart }) 
           </button>
           <button
             onClick={() => setActiveTab('plan')}
-            className={`flex-1 py-2.5 rounded-xl font-medium transition-all ${
+            className={`py-2 rounded-xl font-medium transition-all ${
               activeTab === 'plan'
                 ? 'bg-white text-black font-bold shadow-md'
                 : 'text-zinc-400 hover:text-white'
@@ -258,9 +284,44 @@ export const Results: React.FC<ResultsProps> = ({ result, profile, onRestart }) 
           </button>
         </div>
 
+        {/* Tab Content: PHOTO FLAW INSPECTOR */}
+        {activeTab === 'flaws' && (
+          <div className="space-y-4">
+            <PhotoFlawInspector
+              imageSrc={result.capturedImage}
+              flaws={result.flaws || []}
+              points={result.points}
+              faceShape={result.faceShape}
+            />
+          </div>
+        )}
+
         {/* Tab Content: OVERVIEW */}
         {activeTab === 'overview' && (
           <div className="space-y-4">
+            {/* Quick access banner to flaws */}
+            <div
+              onClick={() => setActiveTab('flaws')}
+              className="p-4 rounded-2xl bg-gradient-to-r from-red-950/30 to-zinc-900 border border-red-900/40 hover:border-red-700/60 cursor-pointer flex items-center justify-between transition-colors"
+            >
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 rounded-xl bg-red-950/80 border border-red-800 text-red-400">
+                  <AlertTriangle className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="text-xs font-bold text-white flex items-center gap-2">
+                    <span>Инспектор дефектов на фото</span>
+                    <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-red-500/20 text-red-300 font-mono">
+                      {result.flaws?.length || 0} отмечено
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-zinc-400">
+                    Интерактивные линии симметрии, тилта и углов на вашем лице
+                  </div>
+                </div>
+              </div>
+              <ChevronRight className="w-4 h-4 text-zinc-400" />
+            </div>
             {/* Morphological profile card */}
             <div className="p-5 rounded-2xl bg-zinc-950 border border-zinc-800">
               <div className="text-xs font-mono uppercase tracking-wider text-zinc-400 mb-3 flex items-center justify-between">

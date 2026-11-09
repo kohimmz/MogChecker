@@ -95,6 +95,8 @@ export const App: React.FC = () => {
         archetype,
         hairAnalysis: realAnalysis.hairAnalysis,
         metrics: realAnalysis.metrics,
+        flaws: realAnalysis.flaws,
+        points: realAnalysis.points,
         faceShape: realAnalysis.faceShape,
         symmetryScore: realAnalysis.symmetryScore,
         jawlineScore: realAnalysis.jawlineScore,

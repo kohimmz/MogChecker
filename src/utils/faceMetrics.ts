@@ -1,4 +1,4 @@
-import { MetricItem, HairAnalysis, ScanResult, UserProfile } from '../types';
+import { MetricItem, HairAnalysis, ScanResult, UserProfile, FlawItem } from '../types';
 import { getArchetypeByScore } from './archetypes';
 
 export function calculateScanResults(
@@ -96,11 +96,73 @@ export function calculateScanResults(
     }
   ];
 
+  const flaws: FlawItem[] = [];
+  if (symmetryScore < 92) {
+    flaws.push({
+      id: 'flaw_sym',
+      title: 'Асимметрия латеральных половин лица',
+      category: 'symmetry',
+      severity: symmetryScore < 80 ? 'high' : 'medium',
+      valueText: `Индекс: ${symmetryScore}% (допуск 95%+)`,
+      idealText: '98%+ Билатеральное совпадение',
+      description: 'Незначительное смещение осевой симметрии скуловых дуг и положения уголков рта.',
+      howToFix: 'Сон на спине, жевание пищи равномерно на обеих сторонах челюсти, контроль мимики.',
+      pinX: 0.50,
+      pinY: 0.40,
+    });
+  }
+
+  if (canthalTilt === 'Отрицательный (-3°)' || canthalTilt === 'Нейтральный (0°)') {
+    flaws.push({
+      id: 'flaw_canthal',
+      title: canthalTilt === 'Отрицательный (-3°)' ? 'Отрицательный кантал-тилт (Prey Eyes)' : 'Нейтральный наклон глаз',
+      category: 'canthal',
+      severity: canthalTilt === 'Отрицательный (-3°)' ? 'high' : 'low',
+      valueText: canthalTilt,
+      idealText: 'Положительный (+4°..+6° Hunter Eyes)',
+      description: 'Внешние уголки глаз расположены на одном уровне или ниже внутренних уголков.',
+      howToFix: 'Гимнастика круговых мышц глаз (squinting-упражнения), массаж височной фасции.',
+      pinX: 0.68,
+      pinY: 0.41,
+    });
+  }
+
+  if (jawlineScore < 8.0) {
+    flaws.push({
+      id: 'flaw_jaw',
+      title: 'Недостаточная резкость линии челюсти',
+      category: 'jaw',
+      severity: jawlineScore < 6.5 ? 'high' : 'medium',
+      valueText: `Оценка угла: ${jawlineScore}/10`,
+      idealText: '9.0+/10 (Гониальный угол 118°-124°)',
+      description: 'Контур угла нижней челюсти сглажен подкожным жиром или положением подъязычной кости.',
+      howToFix: 'Техника Mewing (прижим языка к нёбу), снижение процента жира до 12-14%, жевательная резинка Falim.',
+      pinX: 0.30,
+      pinY: 0.70,
+    });
+  }
+
+  if (hairScore < 8.0) {
+    flaws.push({
+      id: 'flaw_hair',
+      title: 'Субоптимальный объем и линия волос',
+      category: 'hair',
+      severity: 'medium',
+      valueText: `Оценка прически: ${hairScore}/10`,
+      idealText: '9.0+/10 • Плотность и текстурный объем',
+      description: 'Прическа не в полной мере компенсирует геометрию черепа и форму лица.',
+      howToFix: 'Текстурирующий солевой спрей, стрижка с плавным фейдом на висках (Low Taper Fade).',
+      pinX: 0.50,
+      pinY: 0.18,
+    });
+  }
+
   return {
     overallScore: clampedOverall,
     archetype,
     hairAnalysis,
     metrics,
+    flaws,
     faceShape,
     symmetryScore,
     jawlineScore,

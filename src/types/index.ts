@@ -63,11 +63,25 @@ export interface HairAnalysis {
   stylingTips: string[];
 }
 
+export interface FlawItem {
+  id: string;
+  title: string;
+  category: 'symmetry' | 'canthal' | 'jaw' | 'thirds' | 'hair';
+  severity: 'high' | 'medium' | 'low';
+  valueText: string;
+  idealText: string;
+  description: string;
+  howToFix: string;
+  pinX: number;
+  pinY: number;
+}
+
 export interface ScanResult {
   overallScore: number; // 0.0 - 10.0
   archetype: ArchetypeInfo;
   hairAnalysis: HairAnalysis;
   metrics: MetricItem[];
+  flaws: FlawItem[];
   faceShape: 'Овал' | 'Квадрат' | 'Ромб' | 'Прямоугольник' | 'Круг';
   symmetryScore: number;
   jawlineScore: number;
@@ -81,5 +95,6 @@ export interface ScanResult {
     impact: 'Высокий' | 'Средний' | 'Базовый';
   }[];
   capturedImage?: string;
+  points?: Array<{ x: number; y: number }>;
   date: string;
 }

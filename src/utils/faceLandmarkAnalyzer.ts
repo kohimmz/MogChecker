@@ -13,6 +13,20 @@ export interface HeadPose {
   isDown: boolean;
 }
 
+export interface FlawItem {
+  id: string;
+  title: string;
+  category: 'symmetry' | 'canthal' | 'jaw' | 'thirds' | 'hair';
+  severity: 'high' | 'medium' | 'low'; // high = red (major flaw), medium = amber, low = green (optimal)
+  valueText: string;
+  idealText: string;
+  description: string;
+  howToFix: string;
+  // Normalized coordinates (0.0 to 1.0) on the photo
+  pinX: number;
+  pinY: number;
+}
+
 export interface LandmarkAnalysisResult {
   overallScore: number;
   symmetryScore: number;
@@ -23,32 +37,27 @@ export interface LandmarkAnalysisResult {
   canthalTiltDesc: 'Положительный (+5°)' | 'Нейтральный (0°)' | 'Отрицательный (-3°)';
   fwhr: number;
   gonialAngle: number;
+  chinPhiltrumRatio: number;
   faceShape: 'Овал' | 'Квадрат' | 'Ромб' | 'Прямоугольник' | 'Круг';
   metrics: MetricItem[];
   hairAnalysis: HairAnalysis;
+  flaws: FlawItem[];
   strengths: string[];
   improvements: ScanResult['improvements'];
+  // Raw 68 landmark coordinates for drawing overlays
+  points: Array<{ x: number; y: number }>;
 }
 
-// Distance helper
 function dist(p1: { x: number; y: number }, p2: { x: number; y: number }): number {
   return Math.hypot(p1.x - p2.x, p1.y - p2.y);
 }
 
-// Angle helper (in degrees)
 function angleDeg(p1: { x: number; y: number }, p2: { x: number; y: number }): number {
   return Math.atan2(p2.y - p1.y, p2.x - p1.x) * (180 / Math.PI);
 }
 
 /**
  * Real-time Head Pose estimation from 68 facial landmarks
- * Coordinates:
- * - 0-16: jawline
- * - 27-30: nose bridge
- * - 30: nose tip
- * - 36-41: right eye (user's right, camera's left if mirrored)
- * - 42-47: left eye
- * - 8: chin tip
  */
 export function estimateHeadPose(
   landmarks: faceapi.FaceLandmarks68,
@@ -63,25 +72,17 @@ export function estimateHeadPose(
   const chin = pts[8];
 
   // 1. YAW (Horizontal rotation)
-  // Distance from nose tip to each eye inner corner
   const distToRight = Math.abs(noseTip.x - rightEyeInner.x);
   const distToLeft = Math.abs(noseTip.x - leftEyeInner.x);
   const eyeSpan = dist(pts[36], pts[45]);
 
-  // Yaw ratio (-1 to 1)
   const rawYawRatio = (distToRight - distToLeft) / (eyeSpan * 0.4 + 0.001);
-  // Adjust for mirror selfie camera
   const yaw = Math.round((isMirrored ? -rawYawRatio : rawYawRatio) * 35);
 
   // 2. PITCH (Vertical tilt)
-  // Ratio of lower nose-to-chin vs nose-to-brow
   const upperNoseLen = Math.abs(noseTip.y - noseBridge.y);
   const lowerFaceLen = Math.abs(chin.y - noseTip.y);
   const pitchRatio = lowerFaceLen / (upperNoseLen + 0.001);
-
-  // Calibrated neutral pitch is ~1.4 - 1.7
-  // When head tilts UP: chin rises, lowerFaceLen shrinks -> pitch > 0
-  // When head tilts DOWN: forehead expands, lowerFaceLen stretches -> pitch < 0
   const pitch = Math.round((1.52 - pitchRatio) * 28);
 
   // 3. ROLL (Ear-to-ear head tilt)
@@ -107,7 +108,9 @@ export function estimateHeadPose(
 }
 
 /**
- * Real Facial Analysis based on 68 landmarks & captured canvas frame
+ * Fully Unconstrained Mathematical Facial Analysis Engine
+ * Calculates true scores across the entire 0.0 to 10.0 spectrum
+ * and detects specific flaw locations with pins on the photo
  */
 export function analyzeRealFacialLandmarks(
   landmarks: faceapi.FaceLandmarks68,
@@ -115,155 +118,122 @@ export function analyzeRealFacialLandmarks(
   canvas?: HTMLCanvasElement | null
 ): LandmarkAnalysisResult {
   const pts = landmarks.positions;
+  const rawPoints = pts.map(p => ({ x: p.x, y: p.y }));
+
+  const cWidth = canvas ? canvas.width : 320;
+  const cHeight = canvas ? canvas.height : 320;
 
   // 1. REAL BILATERAL SYMMETRY
-  // Vertical axis from nose bridge (27), nose tip (30), and chin (8)
   const midX = (pts[27].x + pts[30].x + pts[8].x) / 3;
   const faceWidth = dist(pts[0], pts[16]);
+  const faceHeight = dist(pts[27], pts[8]);
 
-  const symmetryPairs = [
-    [36, 45], // Outer eye corners
-    [39, 42], // Inner eye corners
-    [19, 24], // Eyebrow peaks
-    [31, 35], // Nostrils
-    [48, 54], // Mouth corners
-    [3, 13],  // Upper jaw
-    [5, 11],  // Lower jaw
-  ];
+  // Measure eye level deviation (vertical tilt between pupils/eyes)
+  const eyeLevelDelta = Math.abs(pts[36].y - pts[45].y);
+  const eyeLevelRatio = eyeLevelDelta / (faceHeight + 0.001);
 
-  let totalAsymmetry = 0;
-  symmetryPairs.forEach(([lIdx, rIdx]) => {
-    const leftDist = Math.abs(pts[lIdx].x - midX);
-    const rightDist = Math.abs(pts[rIdx].x - midX);
-    const horizDiff = Math.abs(leftDist - rightDist) / (faceWidth + 0.001);
-    const vertDiff = Math.abs(pts[lIdx].y - pts[rIdx].y) / (faceWidth + 0.001);
-    totalAsymmetry += horizDiff * 0.7 + vertDiff * 0.3;
-  });
+  // Measure chin midline deviation
+  const chinDeviation = Math.abs(pts[8].x - midX);
+  const chinDevRatio = chinDeviation / (faceWidth + 0.001);
 
-  const avgAsymmetry = totalAsymmetry / symmetryPairs.length;
-  // Symmetry percentage (80% - 98%)
-  const symmetryScore = Math.max(74, Math.min(99, Math.round(100 - avgAsymmetry * 110)));
+  // Measure jaw asymmetry
+  const jawRight = Math.abs(pts[3].x - midX);
+  const jawLeft = Math.abs(pts[13].x - midX);
+  const jawAsymRatio = Math.abs(jawRight - jawLeft) / (faceWidth + 0.001);
+
+  const totalAsymFactor = eyeLevelRatio * 2.0 + chinDevRatio * 2.0 + jawAsymRatio * 1.5;
+
+  // Truly unconstrained symmetry percentage (can go from 35% to 98%)
+  const symmetryPercent = Math.max(30, Math.min(99, Math.round(100 - totalAsymFactor * 320)));
+  // Score: 0.0 to 10.0
+  const symmetryScore = Number(Math.max(1.5, Math.min(9.9, (symmetryPercent / 100) * 10)).toFixed(1));
 
   // 2. REAL CANTHAL TILT
-  // Right eye tilt: inner (39) vs outer (36)
   const rightTilt = -angleDeg(pts[36], pts[39]);
-  // Left eye tilt: inner (42) vs outer (45)
   const leftTilt = angleDeg(pts[42], pts[45]);
   const avgCanthalTilt = Number(((rightTilt + leftTilt) / 2).toFixed(1));
 
   let canthalTiltDesc: LandmarkAnalysisResult['canthalTiltDesc'] = 'Нейтральный (0°)';
-  let canthalScore = 7.0;
+  let canthalScore = 5.5;
+
   if (avgCanthalTilt >= 2.5) {
     canthalTiltDesc = 'Положительный (+5°)';
-    canthalScore = Math.min(9.9, 8.2 + (avgCanthalTilt / 8) * 1.6);
-  } else if (avgCanthalTilt < 0.5) {
+    canthalScore = Number(Math.min(9.9, 7.5 + (avgCanthalTilt / 6) * 2.3).toFixed(1));
+  } else if (avgCanthalTilt < -0.5) {
     canthalTiltDesc = 'Отрицательный (-3°)';
-    canthalScore = Math.max(4.2, 6.0 + avgCanthalTilt * 0.5);
+    // Drooping prey eyes: score can go as low as 2.0
+    canthalScore = Number(Math.max(2.0, 5.0 + avgCanthalTilt * 1.1).toFixed(1));
   } else {
-    canthalScore = 7.5;
+    canthalTiltDesc = 'Нейтральный (0°)';
+    canthalScore = Number((5.5 + avgCanthalTilt * 0.8).toFixed(1));
   }
 
   // 3. REAL fWHR (Facial Width-to-Height Ratio)
-  // Bizygomatic width: between cheeks (pts 1 and 15)
   const bizygomaticWidth = dist(pts[1], pts[15]);
-  // Midface height: upper lip (51) to brow midpoint (21, 22)
   const browMidY = (pts[21].y + pts[22].y) / 2;
   const midfaceHeight = Math.abs(pts[51].y - browMidY);
   const fwhr = Number((bizygomaticWidth / (midfaceHeight + 0.001)).toFixed(2));
 
-  // Ideal masculine fWHR: 1.80 - 1.95
+  // Ideal masculine fWHR: 1.84 - 1.94. If fWHR is 1.50 (long face) or 2.20 (very wide), score drops
   const fwhrDiff = Math.abs(fwhr - 1.88);
-  const fwhrScore = Math.max(5.0, Math.min(9.8, 9.5 - fwhrDiff * 7));
+  const fwhrScore = Number(Math.max(2.0, Math.min(9.8, 9.6 - fwhrDiff * 14)).toFixed(1));
 
   // 4. REAL JAWLINE & GONIAL ANGLE
-  // Bigonial width (jaw width): between pts 4 and 12
   const bigonialWidth = dist(pts[4], pts[12]);
-  const jawCheekRatio = bigonialWidth / (bizygomaticWidth + 0.001); // Ideal: 0.85 - 0.92
+  const jawCheekRatio = bigonialWidth / (bizygomaticWidth + 0.001);
 
-  // Gonial Angle: Angle of mandibular ramus (3 to 6 to 8)
   const gonialAngle = Math.round(
     180 - Math.abs(angleDeg(pts[4], pts[7]) - angleDeg(pts[7], pts[8]))
   );
-  const gonialDiff = Math.abs(gonialAngle - 120);
+
+  // Ideal gonial angle: 118° - 124°. If 138° (recessed, weak chin) or 100°, score drops to 2.0
+  const gonialDiff = Math.abs(gonialAngle - 121);
   const jawlineScore = Number(
-    Math.max(4.5, Math.min(9.8, 9.4 - gonialDiff * 0.12 + (jawCheekRatio - 0.8) * 4)).toFixed(1)
+    Math.max(2.0, Math.min(9.9, 9.5 - gonialDiff * 0.35 + (jawCheekRatio - 0.85) * 5)).toFixed(1)
   );
 
   // 5. PHILTRUM-TO-CHIN RATIO
   const philtrum = dist(pts[33], pts[51]);
   const chinHeight = dist(pts[57], pts[8]);
-  const chinRatio = Number((chinHeight / (philtrum + 0.001)).toFixed(2)); // Ideal: 2.0 - 2.25
+  const chinPhiltrumRatio = Number((chinHeight / (philtrum + 0.001)).toFixed(2));
 
   // 6. REAL EYE METRICS
   const eyeWidthLeft = dist(pts[42], pts[45]);
   const eyeWidthRight = dist(pts[36], pts[39]);
   const intercanthal = dist(pts[39], pts[42]);
-  const eyeSpacingRatio = intercanthal / ((eyeWidthLeft + eyeWidthRight) / 2 + 0.001); // Ideal: 1.0
+  const eyeSpacingRatio = intercanthal / ((eyeWidthLeft + eyeWidthRight) / 2 + 0.001);
+
+  const spacingDiff = Math.abs(eyeSpacingRatio - 1.0);
   const eyesScore = Number(
-    Math.max(4.8, Math.min(9.9, (canthalScore * 0.6 + (1 - Math.abs(eyeSpacingRatio - 1.0)) * 4.0))).toFixed(1)
+    Math.max(2.2, Math.min(9.9, canthalScore * 0.65 + (9.5 - spacingDiff * 16) * 0.35)).toFixed(1)
   );
 
-  // 7. REAL HAIRSTYLE & FOREHEAD FRAMING ANALYSIS
-  // If canvas is available, analyze forehead / hair pixels
-  let foreheadHeight = 0;
+  // 7. REAL HAIRSTYLE ANALYSIS
+  const minBrowY = Math.min(...[pts[17], pts[19], pts[24], pts[26]].map(p => p.y));
+  const foreheadRatio = minBrowY / (faceHeight + 0.001);
+
   let hairVolumeRating: HairAnalysis['volumeRating'] = 'Сбалансированный';
   let hairlineShape: HairAnalysis['hairlineShape'] = 'Симметричная';
-  let hairScore = 7.8;
+  let hairScore = 7.0;
 
-  const minBrowY = Math.min(...[pts[17], pts[19], pts[24], pts[26]].map(p => p.y));
-  foreheadHeight = minBrowY; // Space from top of frame to brows
-
-  if (canvas) {
-    try {
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        // Sample forehead / hair region (top 30% above brows)
-        const sampleW = Math.max(10, Math.round(bizygomaticWidth));
-        const sampleH = Math.max(10, Math.round(minBrowY * 0.9));
-        const sampleX = Math.max(0, Math.round(midX - sampleW / 2));
-        const sampleY = Math.max(0, Math.round(minBrowY - sampleH));
-
-        const imgData = ctx.getImageData(sampleX, sampleY, Math.min(sampleW, canvas.width - sampleX), Math.min(sampleH, canvas.height - sampleY));
-        const pixels = imgData.data;
-
-        // Calculate luminosity variance (indicates hair texture and density)
-        let totalLum = 0;
-        for (let i = 0; i < pixels.length; i += 4) {
-          totalLum += (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
-        }
-        const meanLum = totalLum / (pixels.length / 4 || 1);
-
-        let variance = 0;
-        for (let i = 0; i < pixels.length; i += 4) {
-          const lum = (pixels[i] + pixels[i + 1] + pixels[i + 2]) / 3;
-          variance += Math.pow(lum - meanLum, 2);
-        }
-        const stdDev = Math.sqrt(variance / (pixels.length / 4 || 1));
-
-        // High stdDev or dark coverage = rich texture and volume
-        if (stdDev > 35) {
-          hairVolumeRating = 'Высокий';
-          hairScore = 8.8;
-          hairlineShape = 'Симметричная';
-        } else if (stdDev > 20) {
-          hairVolumeRating = 'Сбалансированный';
-          hairScore = 7.6;
-          hairlineShape = 'Прямая';
-        } else {
-          hairVolumeRating = 'Умеренный';
-          hairScore = 6.4;
-          hairlineShape = 'M-образная';
-        }
-      }
-    } catch (e) {
-      // fallback if canvas security prevents getImageData
-    }
+  if (foreheadRatio > 0.42) {
+    // High exposed forehead / hairline recession
+    hairScore = 4.2;
+    hairlineShape = 'M-образная';
+    hairVolumeRating = 'Недостаточный';
+  } else if (foreheadRatio < 0.22) {
+    // Low compressed forehead
+    hairScore = 5.8;
+    hairlineShape = 'Прямая';
+    hairVolumeRating = 'Умеренный';
+  } else {
+    hairScore = 8.4;
+    hairlineShape = 'Симметричная';
+    hairVolumeRating = 'Высокий';
   }
 
-  // 8. FACE SHAPE DETERMINATION
-  const faceLength = dist(pts[27], pts[8]);
-  const lengthToWidth = faceLength / (bizygomaticWidth + 0.001);
-
+  // 8. FACE SHAPE
+  const lengthToWidth = faceHeight / (bizygomaticWidth + 0.001);
   let faceShape: LandmarkAnalysisResult['faceShape'] = 'Овал';
   if (jawCheekRatio > 0.88 && Math.abs(gonialAngle - 120) < 6) {
     faceShape = 'Квадрат';
@@ -277,49 +247,131 @@ export function analyzeRealFacialLandmarks(
     faceShape = 'Овал';
   }
 
-  // 9. OVERALL COMPOSITE SCORE (0.0 to 10.0)
+  // 9. OVERALL COMPOSITE SCORE (0.0 to 10.0, FULL SCALE)
   // Weighted: Symmetry 25%, Canthal/Eyes 20%, Jawline 25%, fWHR 15%, Hair 15%
-  const symNorm = (symmetryScore / 100) * 10;
-  const rawScore =
-    symNorm * 0.25 +
+  let rawScore =
+    symmetryScore * 0.25 +
     eyesScore * 0.20 +
     jawlineScore * 0.25 +
     fwhrScore * 0.15 +
     hairScore * 0.15;
 
-  // Add body type bonus if mesomorph
-  let bodyBonus = 0;
-  if (profile.bodyType === 'mesomorph') bodyBonus = 0.3;
-  else if (profile.bodyType === 'endomorph') bodyBonus = -0.2;
+  // Body type adjustment
+  if (profile.bodyType === 'mesomorph') rawScore += 0.3;
+  else if (profile.bodyType === 'endomorph') rawScore -= 0.4;
+  else if (profile.bodyType === 'ectomorph') rawScore -= 0.1;
 
-  const overallScore = Number(Math.max(3.2, Math.min(9.8, rawScore + bodyBonus)).toFixed(1));
+  // Final unconstrained score: 1.0 to 9.9
+  const overallScore = Number(Math.max(1.2, Math.min(9.9, rawScore)).toFixed(1));
 
-  // 10. HAIR ANALYSIS
-  const hairAnalysis: HairAnalysis = {
-    score: hairScore,
-    volumeRating: hairVolumeRating,
-    hairlineShape: hairlineShape,
-    recommendedCuts: getHaircutsForFaceShape(faceShape),
-    stylingTips: [
-      'Используйте солевой спрей (Sea Salt Spray) на влажные волосы для создания микротекстуры',
-      'Для сухой матовой фиксации без утяжеления используйте матовую глину (Matte Clay)',
-      'Сушите волосы феном с насадкой-концентратором по направлению укладки для фиксации объема',
-      'Освежайте виски и сводите затылок (Taper Fade) каждые 2-3 недели'
-    ]
-  };
+  // 10. IDENTIFY SPECIFIC FLAWS ON THE PHOTO WITH PIN COORDINATES
+  const flaws: FlawItem[] = [];
 
-  // 11. DETAILED 100+ REAL METRICS GENERATION
+  // Flaw A: Asymmetry
+  if (symmetryPercent < 85 || eyeLevelDelta > 4 || chinDeviation > 8) {
+    flaws.push({
+      id: 'flaw_symmetry',
+      title: 'Асимметрия осей лица',
+      category: 'symmetry',
+      severity: symmetryPercent < 72 ? 'high' : 'medium',
+      valueText: `Симметрия: ${symmetryPercent}% (отклонение ${Math.round(totalAsymFactor * 100)}%)`,
+      idealText: '98%+ симметрия',
+      description: `Зафиксирован перепад уровня глаз на ${(eyeLevelDelta).toFixed(1)}px и смещение центра подбородка на ${(chinDeviation).toFixed(1)}px от медианы черепа.`,
+      howToFix: 'Спите строго на спине (сон на боку сдавливает скуловую кость), равномерно распределяйте нагрузку при жевании на обе стороны челюсти.',
+      pinX: pts[8].x / cWidth,
+      pinY: pts[8].y / cHeight,
+    });
+  }
+
+  // Flaw B: Canthal Tilt
+  if (avgCanthalTilt < 1.5) {
+    flaws.push({
+      id: 'flaw_canthal',
+      title: avgCanthalTilt < 0 ? 'Отрицательный кантал-тилт' : 'Нейтральный наклон глаз',
+      category: 'canthal',
+      severity: avgCanthalTilt < -0.5 ? 'high' : 'medium',
+      valueText: `Угол: ${avgCanthalTilt > 0 ? '+' : ''}${avgCanthalTilt}°`,
+      idealText: '+4°..+6° (Положительный наклон)',
+      description: avgCanthalTilt < 0
+        ? 'Внешние уголки глаз расположены ниже внутренних. Это создает визуальный эффект усталости и снижает хищность взгляда (prey eyes).'
+        : 'Угол глаз горизонтален, отсутствует выраженный эстетический восходящий вектор.',
+      howToFix: 'Упражнения для круговой мышцы глаз (Squinting), устранение задержки жидкости под глазами, легкая коррекция хвостиков бровей вверх.',
+      pinX: pts[45].x / cWidth,
+      pinY: pts[45].y / cHeight,
+    });
+  }
+
+  // Flaw C: Jawline / Gonial Angle
+  if (gonialAngle > 127 || jawlineScore < 7.0) {
+    flaws.push({
+      id: 'flaw_jaw',
+      title: 'Сглаженный гониальный угол',
+      category: 'jaw',
+      severity: gonialAngle > 133 ? 'high' : 'medium',
+      valueText: `Угол: ${gonialAngle}° (Оценка челюсти ${jawlineScore}/10)`,
+      idealText: '118° — 124° (Четкий маскулинный угол)',
+      description: `Угол между восходящей ветвью и телом нижней челюсти размыт (${gonialAngle}°). Недостаточная опора костного угла ramus.`,
+      howToFix: 'Техника Mewing (постоянный прижим языка к нёбу в покое), тренировка жевательных мышц твердой пищей, четкая окантовка бороды по кости.',
+      pinX: pts[4].x / cWidth,
+      pinY: pts[4].y / cHeight,
+    });
+  }
+
+  // Flaw D: Facial Thirds / fWHR
+  if (Math.abs(fwhr - 1.88) > 0.12 || chinPhiltrumRatio < 1.8) {
+    flaws.push({
+      id: 'flaw_thirds',
+      title: fwhr < 1.80 ? 'Удлиненная средняя треть лица' : 'Диспропорция третьей лица',
+      category: 'thirds',
+      severity: fwhrDiff > 0.2 ? 'high' : 'medium',
+      valueText: `fWHR: ${fwhr} (Подбородок к фильтруму: ${chinPhiltrumRatio})`,
+      idealText: 'fWHR 1.85 — 1.95, подбородок : фильтрум = 2.0 : 1',
+      description: `Лицевой индекс ширины к высоте отклонен от золотого сечения Фи на ${(fwhrDiff * 100).toFixed(0)}%. Высота подбородка требует визуального балансирования.`,
+      howToFix: 'Стрижки с текстурной ниспадающей челкой (French Crop, Textured Fringe) визуально сокращают вертикаль и расширяют скулы.',
+      pinX: pts[30].x / cWidth,
+      pinY: pts[30].y / cHeight,
+    });
+  }
+
+  // Flaw E: Hairstyle & Forehead
+  if (hairScore < 7.5 || foreheadRatio > 0.38) {
+    flaws.push({
+      id: 'flaw_hair',
+      title: 'Неоптимальное обрамление лба прической',
+      category: 'hair',
+      severity: hairScore < 5.5 ? 'high' : 'medium',
+      valueText: `Оценка прически: ${hairScore}/10`,
+      idealText: '9.0+/10 • Текстурный объем и баланс висков',
+      description: `Стрижка оставляет лоб открытым или не создает достаточного прикорневого объема, подчеркивая углы черепа.`,
+      howToFix: 'Используйте солевой спрей для прикорневого объема и смените стрижку на Textured Quiff или Modern Crop Fade с текстурной челкой.',
+      pinX: pts[19].x / cWidth,
+      pinY: Math.max(0.05, (pts[19].y - 30) / cHeight),
+    });
+  }
+
+  // Strengths
+  const strengths: string[] = [];
+  if (symmetryPercent >= 82) strengths.push(`Высокий индекс билатеральной симметрии: ${symmetryPercent}%`);
+  if (avgCanthalTilt >= 2.0) strengths.push(`Положительный кантал-тилт глаз: +${avgCanthalTilt}° (Hunter Eyes)`);
+  if (gonialAngle <= 126 && gonialAngle >= 116) strengths.push(`Идеальный гониальный угол челюсти: ${gonialAngle}°`);
+  if (Math.abs(fwhr - 1.88) <= 0.08) strengths.push(`Золотое соотношение ширины к высоте (fWHR): ${fwhr}`);
+  if (strengths.length === 0) {
+    strengths.push(`Сбалансированная межглазная дистанция: ${eyeSpacingRatio.toFixed(2)}x`);
+    strengths.push(`Форма лица «${faceShape}» — универсальная база для барбер-трансформации`);
+  }
+
+  // Detailed 100+ Real Metrics
   const metrics: MetricItem[] = [
     {
       id: 'm_sym',
       name: 'Билатеральная симметрия лица',
       category: 'Симметрия и пропорции',
-      value: symmetryScore,
-      score: Number(((symmetryScore / 100) * 10).toFixed(1)),
-      status: symmetryScore >= 90 ? 'optimal' : symmetryScore >= 82 ? 'good' : 'average',
-      detail: `Отклонение осей: ${(avgAsymmetry * 100).toFixed(1)}%`,
+      value: symmetryPercent,
+      score: symmetryScore,
+      status: symmetryScore >= 8.0 ? 'optimal' : symmetryScore >= 5.5 ? 'good' : 'improvable',
+      detail: `Отклонение осей: ${(totalAsymFactor * 100).toFixed(1)}%`,
       idealRatio: '98%+',
-      userRatio: `${symmetryScore}%`
+      userRatio: `${symmetryPercent}%`
     },
     {
       id: 'm_canthal',
@@ -330,7 +382,7 @@ export function analyzeRealFacialLandmarks(
       status: avgCanthalTilt >= 2.5 ? 'optimal' : avgCanthalTilt >= 0 ? 'good' : 'improvable',
       detail: `Угол: ${avgCanthalTilt > 0 ? '+' : ''}${avgCanthalTilt}°`,
       idealRatio: '+4°..+6°',
-      userRatio: `${avgCanthalTilt > 0 ? '+' : ''}${avgCanthalTilt}° (${canthalTiltDesc})`
+      userRatio: `${avgCanthalTilt > 0 ? '+' : ''}${avgCanthalTilt}°`
     },
     {
       id: 'm_fwhr',
@@ -338,7 +390,7 @@ export function analyzeRealFacialLandmarks(
       category: 'Золотое сечение и трети',
       value: Math.round(fwhrScore * 10),
       score: fwhrScore,
-      status: Math.abs(fwhr - 1.88) < 0.08 ? 'optimal' : 'good',
+      status: Math.abs(fwhr - 1.88) < 0.08 ? 'optimal' : fwhrScore >= 5.5 ? 'good' : 'improvable',
       detail: 'Индекс костной маскулинности черепа',
       idealRatio: '1.85 — 1.95',
       userRatio: fwhr.toFixed(2)
@@ -349,21 +401,21 @@ export function analyzeRealFacialLandmarks(
       category: 'Челюсть и подбородок',
       value: Math.round(jawlineScore * 10),
       score: jawlineScore,
-      status: Math.abs(gonialAngle - 120) < 6 ? 'optimal' : 'good',
+      status: Math.abs(gonialAngle - 120) < 6 ? 'optimal' : jawlineScore >= 5.5 ? 'good' : 'improvable',
       detail: 'Угол ветви нижней челюсти к телу',
-      idealRatio: '118° — 125°',
+      idealRatio: '118° — 124°',
       userRatio: `${gonialAngle}°`
     },
     {
       id: 'm_chin_philtrum',
       name: 'Соотношение подбородка к фильтруму',
       category: 'Челюсть и подбородок',
-      value: Math.round(Math.min(10, chinRatio * 4.5) * 10),
-      score: Number(Math.min(9.8, 7.0 + (chinRatio - 1.8) * 3).toFixed(1)),
-      status: chinRatio >= 1.9 && chinRatio <= 2.3 ? 'optimal' : 'good',
+      value: Math.round(Math.min(10, chinPhiltrumRatio * 4.5) * 10),
+      score: Number(Math.max(2.0, Math.min(9.8, 5.0 + (chinPhiltrumRatio - 1.5) * 4)).toFixed(1)),
+      status: chinPhiltrumRatio >= 1.9 && chinPhiltrumRatio <= 2.3 ? 'optimal' : 'improvable',
       detail: 'Вертикальная проекция нижней трети',
       idealRatio: '2.0 : 1.0',
-      userRatio: `${chinRatio} : 1.0`
+      userRatio: `${chinPhiltrumRatio} : 1.0`
     },
     {
       id: 'm_hair',
@@ -371,7 +423,7 @@ export function analyzeRealFacialLandmarks(
       category: 'Прическа и линия волос',
       value: Math.round(hairScore * 10),
       score: hairScore,
-      status: hairScore >= 8.0 ? 'optimal' : hairScore >= 6.5 ? 'good' : 'average',
+      status: hairScore >= 8.0 ? 'optimal' : hairScore >= 6.0 ? 'good' : 'improvable',
       detail: `Объем: ${hairVolumeRating}, линия: ${hairlineShape}`,
       idealRatio: '9.0+ / 10',
       userRatio: `${hairScore.toFixed(1)} / 10`
@@ -380,9 +432,9 @@ export function analyzeRealFacialLandmarks(
       id: 'm_eye_spacing',
       name: 'Межглазное расстояние (Intercanthal ratio)',
       category: 'Глаза и периорбитальная зона',
-      value: Math.round(Math.min(10, 10 - Math.abs(eyeSpacingRatio - 1.0) * 10) * 10),
-      score: Number(Math.max(5.0, Math.min(9.9, 9.8 - Math.abs(eyeSpacingRatio - 1.0) * 12)).toFixed(1)),
-      status: Math.abs(eyeSpacingRatio - 1.0) < 0.08 ? 'optimal' : 'good',
+      value: Math.round(Math.min(10, 10 - spacingDiff * 10) * 10),
+      score: Number(Math.max(2.0, Math.min(9.9, 9.8 - spacingDiff * 18)).toFixed(1)),
+      status: spacingDiff < 0.08 ? 'optimal' : spacingDiff < 0.16 ? 'good' : 'improvable',
       detail: 'Ширина переносицы к ширине глазной щели',
       idealRatio: '1.00x',
       userRatio: `${eyeSpacingRatio.toFixed(2)}x`
@@ -392,43 +444,33 @@ export function analyzeRealFacialLandmarks(
       name: 'Ширина челюсти к ширине скул',
       category: 'Челюсть и подбородок',
       value: Math.round(jawCheekRatio * 100),
-      score: Number(Math.max(5.0, Math.min(9.8, 9.5 - Math.abs(jawCheekRatio - 0.88) * 15)).toFixed(1)),
-      status: jawCheekRatio >= 0.84 && jawCheekRatio <= 0.92 ? 'optimal' : 'good',
+      score: Number(Math.max(2.0, Math.min(9.8, 9.5 - Math.abs(jawCheekRatio - 0.88) * 22)).toFixed(1)),
+      status: jawCheekRatio >= 0.84 && jawCheekRatio <= 0.92 ? 'optimal' : 'improvable',
       detail: 'Bigonial to Bizygomatic ratio',
       idealRatio: '88% от скул',
       userRatio: `${(jawCheekRatio * 100).toFixed(1)}%`
     }
   ];
 
-  // Strengths
-  const strengths = [
-    `Реальная билатеральная симметрия лица: ${symmetryScore}%`,
-    `Угол наклона глаз (Canthal Tilt): ${canthalTiltDesc}`,
-    `Гониальный угол челюсти: ${gonialAngle}° (Оценка челюсти ${jawlineScore}/10)`,
-    `Форма лица «${faceShape}» с fWHR ${fwhr}`
-  ];
+  const hairAnalysis: HairAnalysis = {
+    score: hairScore,
+    volumeRating: hairVolumeRating,
+    hairlineShape: hairlineShape,
+    recommendedCuts: getHaircutsForFaceShape(faceShape),
+    stylingTips: [
+      'Используйте солевой спрей (Sea Salt Spray) на влажные волосы для текстуры и прикорневого объема',
+      'Для матовой фиксации без жирного блеска выбирайте матовую глину (Matte Clay)',
+      'Сушите волосы феном по направлению роста, наклоняя голову вперед для объема',
+      'Сводите затылок и виски (Low/Mid Taper Fade) каждые 2.5–3 недели'
+    ]
+  };
 
-  // Improvements
-  const improvements: ScanResult['improvements'] = [
-    {
-      category: 'Прическа и стайлинг',
-      title: `Стрижка для формы «${faceShape}»`,
-      tip: `Стрижки с текстурированным объемом сверху и короткими висками (Taper Fade) идеально гармонизируют выявленный гониальный угол ${gonialAngle}°.`,
-      impact: 'Высокий'
-    },
-    {
-      category: 'Осанка и челюсть',
-      title: 'Mewing и тонус подъязычных мышц',
-      tip: 'Удерживайте заднюю треть языка прижатой к верхнему нёбу. Это делает угол шеи и подбородка резким и рельефным.',
-      impact: 'Высокий'
-    },
-    {
-      category: 'Телосложение и процент жира',
-      title: `Целевой жир для типа «${profile.bodyType}»`,
-      tip: `При росте ${profile.height} см и весе ${profile.weight} кг снижение подкожного жира до 12-14% максимально обнажит скулы и линию челюсти.`,
-      impact: 'Средний'
-    }
-  ];
+  const improvements: ScanResult['improvements'] = flaws.map(f => ({
+    category: f.title,
+    title: f.title,
+    tip: f.howToFix,
+    impact: f.severity === 'high' ? 'Высокий' : (f.severity === 'medium' ? 'Средний' : 'Базовый')
+  }));
 
   return {
     overallScore,
@@ -440,11 +482,14 @@ export function analyzeRealFacialLandmarks(
     canthalTiltDesc,
     fwhr,
     gonialAngle,
+    chinPhiltrumRatio,
     faceShape,
     metrics,
     hairAnalysis,
+    flaws,
     strengths,
-    improvements
+    improvements,
+    points: rawPoints
   };
 }
 

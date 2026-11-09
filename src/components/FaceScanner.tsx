@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as faceapi from '@vladmandic/face-api';
+import { Camera as CapCamera, CameraResultType, CameraSource } from '@capacitor/camera';
 import { ScanDirection } from '../types';
 import { estimateHeadPose, HeadPose } from '../utils/faceLandmarkAnalyzer';
 import {
@@ -9,7 +10,8 @@ import {
   ArrowLeft,
   CheckCircle,
   Loader2,
-  HelpCircle
+  RefreshCw,
+  Sparkles
 } from 'lucide-react';
 
 interface FaceScannerProps {
@@ -22,10 +24,10 @@ interface FaceScannerProps {
 }
 
 const STAGES: Array<{ id: ScanDirection; title: string; instruction: string; hint: string }> = [
-  { id: 'center', title: 'Центр', instruction: 'Смотрите прямо в центр круга', hint: 'Удерживайте нейтральный взгляд' },
-  { id: 'left', title: 'Влево', instruction: 'Поверните голову влево', hint: 'Плавный поворот головы налево' },
-  { id: 'right', title: 'Вправо', instruction: 'Поверните голову вправо', hint: 'Плавный поворот головы направо' },
-  { id: 'up', title: 'Вверх', instruction: 'Приподнимите подбородок вверх', hint: 'Слегка наклоните голову назад' },
+  { id: 'center', title: 'Центр', instruction: 'Смотрите прямо в центр круга', hint: 'Удерживайте нейтральный взгляд по центру' },
+  { id: 'left', title: 'Влево', instruction: 'Поверните голову влево', hint: 'Медленно поверните голову налево' },
+  { id: 'right', title: 'Вправо', instruction: 'Поверните голову вправо', hint: 'Медленно поверните голову направо' },
+  { id: 'up', title: 'Вверх', instruction: 'Приподнимите подбородок вверх', hint: 'Слегка запрокиньте голову назад' },
   { id: 'down', title: 'Вниз', instruction: 'Опустите подбородок вниз', hint: 'Слегка наклоните голову вперед' },
 ];
 
@@ -42,6 +44,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
   const [completedStages, setCompletedStages] = useState<ScanDirection[]>([]);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  const [isInitializingCamera, setIsInitializingCamera] = useState(false);
   
   // Real Head Pose State
   const [headPose, setHeadPose] = useState<HeadPose | null>(null);
@@ -49,14 +52,13 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
   const [capturedPhoto, setCapturedPhoto] = useState<string | undefined>();
   const [calibratedLandmarks, setCalibratedLandmarks] = useState<faceapi.FaceLandmarks68 | null>(null);
 
-  // Success hold timers
   const poseHoldCounter = useRef(0);
   const isTransitioning = useRef(false);
 
   const currentStage = STAGES[currentStageIndex];
-  const scanProgress = ((completedStages.length) / STAGES.length) * 100;
+  const scanProgress = (completedStages.length / STAGES.length) * 100;
 
-  // 1. Load Real Models from public/models
+  // 1. Load Real Models
   useEffect(() => {
     let isMounted = true;
 
@@ -73,7 +75,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
       } catch (err: any) {
         console.error('Failed to load face-api models:', err);
         if (isMounted) {
-          setModelLoadingError('Не удалось загрузить локальную модель распознавания лица.');
+          setModelLoadingError('Ошибка загрузки AI моделей. Проверьте интернет или память.');
         }
       }
     }
@@ -84,65 +86,76 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     };
   }, []);
 
-  // 2. Start Front Camera
-  useEffect(() => {
-    let isMounted = true;
+  // 2. Multi-tier camera initialization
+  const startCamera = useCallback(async () => {
+    setIsInitializingCamera(true);
+    setCameraError(null);
 
-    async function startCamera() {
+    // Step A: Request native Android camera permission via Capacitor Camera plugin
+    try {
+      if (CapCamera && CapCamera.requestPermissions) {
+        await CapCamera.requestPermissions();
+      }
+    } catch (e) {
+      // Browser or already granted
+    }
+
+    // Step B: Multi-tier getUserMedia acquisition
+    let stream: MediaStream | null = null;
+
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      // Tier 1: Try front camera (selfie)
       try {
-        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-          throw new Error('Камера недоступна в этой среде');
-        }
-
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: 'user',
-            width: { ideal: 640 },
-            height: { ideal: 640 },
-          },
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user' },
           audio: false,
         });
-
-        if (!isMounted) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.onloadedmetadata = () => {
-            videoRef.current?.play().catch(() => {});
-            setCameraActive(true);
-          };
-        }
-      } catch (err: any) {
-        console.warn('Camera error:', err);
-        if (isMounted) {
-          setCameraActive(false);
-          setCameraError('Доступ к фронтальной камере ограничен. Разрешите доступ или загрузите снимок из галереи.');
+      } catch (err1) {
+        console.warn('Tier 1 facingMode:user failed, trying generic video:true', err1);
+        // Tier 2: Try any available video sensor
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+        } catch (err2) {
+          console.warn('Tier 2 generic video failed:', err2);
         }
       }
     }
 
+    if (stream && videoRef.current) {
+      streamRef.current = stream;
+      videoRef.current.srcObject = stream;
+      videoRef.current.onloadedmetadata = () => {
+        videoRef.current?.play().catch(() => {});
+        setCameraActive(true);
+        setIsInitializingCamera(false);
+      };
+    } else {
+      setIsInitializingCamera(false);
+      setCameraActive(false);
+      setCameraError('Не удалось запустить видеопоток с камеры. Вы можете сделать фото через системную камеру или выбрать снимок из галереи.');
+    }
+  }, []);
+
+  useEffect(() => {
     if (modelsLoaded) {
       startCamera();
     }
-
     return () => {
-      isMounted = false;
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [modelsLoaded]);
+  }, [modelsLoaded, startCamera]);
 
   // Stage Advancement Handler
   const advanceToNextStage = useCallback((landmarks: faceapi.FaceLandmarks68) => {
     if (isTransitioning.current) return;
     isTransitioning.current = true;
 
-    // Haptic feedback if available on device
+    // Haptic feedback
     if (typeof navigator !== 'undefined' && navigator.vibrate) {
       try { navigator.vibrate(60); } catch (e) {}
     }
@@ -154,12 +167,12 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     if (currentStageIndex === 0 && videoRef.current) {
       try {
         const offCanvas = document.createElement('canvas');
-        offCanvas.width = 320;
-        offCanvas.height = 320;
+        offCanvas.width = videoRef.current.videoWidth || 320;
+        offCanvas.height = videoRef.current.videoHeight || 320;
         const ctx = offCanvas.getContext('2d');
         if (ctx) {
-          ctx.drawImage(videoRef.current, 0, 0, 320, 320);
-          const dataUrl = offCanvas.toDataURL('image/jpeg', 0.85);
+          ctx.drawImage(videoRef.current, 0, 0, offCanvas.width, offCanvas.height);
+          const dataUrl = offCanvas.toDataURL('image/jpeg', 0.9);
           setCapturedPhoto(dataUrl);
         }
       } catch (e) {}
@@ -172,16 +185,15 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
       poseHoldCounter.current = 0;
       setTimeout(() => {
         isTransitioning.current = false;
-      }, 400);
+      }, 350);
     } else {
-      // Completed all 5 angles!
       setTimeout(() => {
         onScanComplete(landmarks, capturedPhoto, canvasRef.current || undefined);
       }, 500);
     }
   }, [currentStageIndex, capturedPhoto, onScanComplete]);
 
-  // 3. Real Computer Vision Loop
+  // 3. Real-time Computer Vision Detection Loop
   useEffect(() => {
     if (!modelsLoaded || !cameraActive) return;
 
@@ -205,7 +217,6 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
       isProcessing = true;
 
       try {
-        // Run real face detection with 68 landmarks
         const detection = await faceapi
           .detectSingleFace(
             video,
@@ -223,14 +234,14 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
             const resizedDetection = faceapi.resizeResults(detection, dims);
             const landmarks = resizedDetection.landmarks;
 
-            // Draw Real 68 Facial Landmark Mesh
+            // Draw Real 68 Points
             drawRealFaceMesh(ctx, landmarks);
 
             // Compute Real Head Pose (Yaw, Pitch, Roll)
             const pose = estimateHeadPose(landmarks, true);
             setHeadPose(pose);
 
-            // Verify Current Stage Condition
+            // Verify Stage Condition
             let isCurrentPoseMatched = false;
             if (currentStage.id === 'center') {
               isCurrentPoseMatched = pose.isCenter;
@@ -246,7 +257,6 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
 
             if (isCurrentPoseMatched && !isTransitioning.current) {
               poseHoldCounter.current += 1;
-              // Hold for ~4 frames (~200ms) to confirm intentional head turn
               if (poseHoldCounter.current >= 4) {
                 advanceToNextStage(landmarks);
               }
@@ -260,7 +270,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
           }
         }
       } catch (err) {
-        // frame processing non-fatal error
+        // frame processing catch
       } finally {
         isProcessing = false;
         animId = requestAnimationFrame(processFrame);
@@ -290,7 +300,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     }
     ctx.stroke();
 
-    // Right Eyebrow: 17 - 21
+    // Eyebrows
     ctx.beginPath();
     for (let i = 17; i <= 21; i++) {
       if (i === 17) ctx.moveTo(pts[i].x, pts[i].y);
@@ -298,7 +308,6 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     }
     ctx.stroke();
 
-    // Left Eyebrow: 22 - 26
     ctx.beginPath();
     for (let i = 22; i <= 26; i++) {
       if (i === 22) ctx.moveTo(pts[i].x, pts[i].y);
@@ -306,7 +315,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     }
     ctx.stroke();
 
-    // Nose Bridge: 27 - 30 & Nose Tip: 31 - 35
+    // Nose
     ctx.beginPath();
     for (let i = 27; i <= 30; i++) {
       if (i === 27) ctx.moveTo(pts[i].x, pts[i].y);
@@ -314,15 +323,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     }
     ctx.stroke();
 
-    ctx.beginPath();
-    for (let i = 31; i <= 35; i++) {
-      if (i === 31) ctx.moveTo(pts[i].x, pts[i].y);
-      else ctx.lineTo(pts[i].x, pts[i].y);
-    }
-    ctx.closePath();
-    ctx.stroke();
-
-    // Right Eye: 36 - 41
+    // Eyes
     ctx.beginPath();
     for (let i = 36; i <= 41; i++) {
       if (i === 36) ctx.moveTo(pts[i].x, pts[i].y);
@@ -331,7 +332,6 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     ctx.closePath();
     ctx.stroke();
 
-    // Left Eye: 42 - 47
     ctx.beginPath();
     for (let i = 42; i <= 47; i++) {
       if (i === 42) ctx.moveTo(pts[i].x, pts[i].y);
@@ -340,7 +340,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     ctx.closePath();
     ctx.stroke();
 
-    // Lips: 48 - 67
+    // Lips
     ctx.beginPath();
     for (let i = 48; i <= 59; i++) {
       if (i === 48) ctx.moveTo(pts[i].x, pts[i].y);
@@ -349,7 +349,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     ctx.closePath();
     ctx.stroke();
 
-    // Draw prominent landmark dots
+    // Highlight key dots
     const keyIndices = [36, 39, 42, 45, 30, 8, 48, 54, 19, 24, 4, 12];
     keyIndices.forEach((idx) => {
       ctx.beginPath();
@@ -358,15 +358,50 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     });
   };
 
-  // 4. File Upload with Real Landmark Detection
+  // Tier 3: Native Android Camera Snap
+  const handleNativeCameraSnap = async () => {
+    try {
+      const image = await CapCamera.getPhoto({
+        quality: 90,
+        allowEditing: false,
+        resultType: CameraResultType.DataUrl,
+        source: CameraSource.Camera,
+      });
+
+      if (image && image.dataUrl) {
+        await processStaticPhoto(image.dataUrl);
+      }
+    } catch (e) {
+      console.warn('Native camera cancelled or failed:', e);
+    }
+  };
+
+  // Tier 4: Gallery Image Picker
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const dataUrl = event.target?.result as string;
+      if (dataUrl) {
+        await processStaticPhoto(dataUrl);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Process static image with 68 landmarks
+  const processStaticPhoto = async (dataUrl: string) => {
     try {
-      const img = await faceapi.bufferToImage(file);
+      const img = new Image();
+      img.src = dataUrl;
+      await new Promise((resolve) => {
+        img.onload = resolve;
+      });
+
       const detection = await faceapi
-        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }))
+        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.25 }))
         .withFaceLandmarks(false);
 
       if (detection) {
@@ -376,18 +411,18 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
         const ctx = offCanvas.getContext('2d');
         ctx?.drawImage(img, 0, 0);
 
-        setCapturedPhoto(offCanvas.toDataURL('image/jpeg', 0.85));
-        onScanComplete(detection.landmarks, offCanvas.toDataURL('image/jpeg', 0.85), offCanvas);
+        setCapturedPhoto(dataUrl);
+        onScanComplete(detection.landmarks, dataUrl, offCanvas);
       } else {
-        alert('Лицо на фото не обнаружено. Пожалуйста, выберите четкое фронтальное фото.');
+        alert('Лицо на фото не обнаружено. Пожалуйста, сделайте четкое фото лица с хорошим освещением.');
       }
     } catch (err) {
-      console.error('File detection error:', err);
-      alert('Ошибка обработки изображения.');
+      console.error('Photo analysis error:', err);
+      alert('Ошибка при анализе фото.');
     }
   };
 
-  // Render Apple Face ID circular ticks
+  // Apple Face ID Ticks
   const renderTicks = () => {
     const ticks = [];
     const radius = 135;
@@ -450,7 +485,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
       {/* Main Face ID Viewport */}
       <div className="my-auto flex flex-col items-center justify-center relative">
         <div className="relative w-[300px] h-[300px] flex items-center justify-center">
-          {/* Radial Ticks Ring */}
+          {/* Radial Ticks */}
           <svg
             className="absolute inset-0 w-full h-full pointer-events-none z-20"
             viewBox="0 0 300 300"
@@ -469,16 +504,25 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
                 className="w-full h-full object-cover -scale-x-100"
               />
             ) : (
-              <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-900 text-zinc-500 p-4 text-center">
-                {!modelsLoaded ? (
+              <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-900 text-zinc-400 p-4 text-center">
+                {!modelsLoaded || isInitializingCamera ? (
                   <>
                     <Loader2 className="w-8 h-8 text-white animate-spin mb-2" />
-                    <span className="text-xs font-mono text-zinc-300">Загрузка AI моделей...</span>
+                    <span className="text-xs font-mono text-zinc-300">
+                      {!modelsLoaded ? 'Загрузка AI моделей...' : 'Подключение камеры...'}
+                    </span>
                   </>
                 ) : (
                   <>
                     <Camera className="w-8 h-8 text-zinc-400 mb-2" />
-                    <span className="text-xs font-mono text-zinc-400">Ожидание камеры</span>
+                    <span className="text-xs font-mono text-zinc-300 mb-2">Видеопоток недоступен</span>
+                    <button
+                      onClick={startCamera}
+                      className="px-3 py-1.5 rounded-lg bg-zinc-800 text-white text-xs font-mono border border-zinc-700 flex items-center gap-1.5"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Повторить
+                    </button>
                   </>
                 )}
               </div>
@@ -493,7 +537,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
             />
           </div>
 
-          {/* Halo */}
+          {/* Glowing Halo */}
           <div className="absolute inset-0 rounded-full bg-white/5 blur-2xl pointer-events-none" />
         </div>
 
@@ -506,11 +550,11 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
         )}
 
         {/* Step Instructions */}
-        <div className="mt-5 text-center max-w-xs">
-          <div className="inline-block px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-[11px] font-mono uppercase tracking-widest text-zinc-400 mb-2">
+        <div className="mt-4 text-center max-w-xs">
+          <div className="inline-block px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-[11px] font-mono uppercase tracking-widest text-zinc-400 mb-1">
             ЭТАП {currentStageIndex + 1}: {currentStage.title}
           </div>
-          <h3 className="text-lg sm:text-xl font-bold text-white tracking-tight mb-1">
+          <h3 className="text-lg font-bold text-white tracking-tight mb-0.5">
             {currentStage.instruction}
           </h3>
           <p className="text-xs text-zinc-400">
@@ -540,20 +584,29 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
         </div>
       </div>
 
-      {/* Footer Controls */}
-      <div className="pt-2 flex flex-col gap-2.5">
+      {/* Footer Controls & Fail-proof camera buttons */}
+      <div className="pt-2 flex flex-col gap-2">
         {cameraError && (
-          <div className="p-3 rounded-xl bg-zinc-900/90 border border-zinc-800 flex items-start gap-2.5 text-xs text-zinc-400">
-            <AlertCircle className="w-4 h-4 text-zinc-300 shrink-0 mt-0.5" />
+          <div className="p-3 rounded-xl bg-zinc-900/95 border border-zinc-800 text-xs text-zinc-300 flex items-start gap-2.5">
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
             <span>{cameraError}</span>
           </div>
         )}
 
-        <div className="flex items-center gap-2">
-          {/* Real Photo Upload Fallback */}
-          <label className="flex-1 py-3 px-3 rounded-xl font-mono text-xs tracking-wide bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition-colors flex items-center justify-center gap-2 cursor-pointer uppercase">
-            <Upload className="w-3.5 h-3.5" />
-            <span>Анализ фото из галереи</span>
+        <div className="grid grid-cols-2 gap-2">
+          {/* Native Phone Camera Snap */}
+          <button
+            onClick={handleNativeCameraSnap}
+            className="py-3 px-3 rounded-xl font-mono text-xs tracking-wide bg-zinc-900 text-white border border-zinc-700 hover:bg-zinc-800 transition-colors flex items-center justify-center gap-2 uppercase font-medium"
+          >
+            <Camera className="w-4 h-4 text-emerald-400" />
+            <span>Сделать фото</span>
+          </button>
+
+          {/* Photo Gallery Upload */}
+          <label className="py-3 px-3 rounded-xl font-mono text-xs tracking-wide bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 transition-colors flex items-center justify-center gap-2 cursor-pointer uppercase font-medium">
+            <Upload className="w-4 h-4" />
+            <span>Из галереи</span>
             <input
               type="file"
               accept="image/*"
@@ -561,21 +614,20 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
               onChange={handleFileUpload}
             />
           </label>
-
-          {/* Calibrate / Skip manually if user is stuck */}
-          {calibratedLandmarks && (
-            <button
-              onClick={() => advanceToNextStage(calibratedLandmarks)}
-              className="py-3 px-4 rounded-xl font-mono text-xs bg-zinc-900 text-zinc-300 hover:text-white border border-zinc-800 uppercase"
-              title="Зафиксировать текущий ракурс"
-            >
-              Фикс
-            </button>
-          )}
         </div>
 
-        <div className="text-center text-[10px] text-zinc-600 font-mono">
-          НЕЙРОСЕТЬ ВЫЧИСЛЯЕТ РЕАЛЬНЫЕ УГЛЫ НА ВАШЕМ УСТРОЙСТВЕ
+        {/* Skip to Next angle if user is physically locked */}
+        {calibratedLandmarks && (
+          <button
+            onClick={() => advanceToNextStage(calibratedLandmarks)}
+            className="w-full py-2.5 rounded-xl font-mono text-xs bg-zinc-950 text-zinc-400 hover:text-white border border-zinc-850 uppercase"
+          >
+            Зафиксировать ракурс вручную
+          </button>
+        )}
+
+        <div className="text-center text-[10px] text-zinc-500 font-mono">
+          НЕЙРОСЕТЬ ВЫЧИСЛЯЕТ РЕАЛЬНЫЕ ТОЧКИ НА ВАШЕМ УСТРОЙСТВЕ
         </div>
       </div>
     </div>
