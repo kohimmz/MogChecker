@@ -45,7 +45,10 @@ export const PhotoFlawInspector: React.FC<PhotoFlawInspectorProps> = ({
     // Use landmarks if available, otherwise estimate standard anatomical positions
     const p = (idx: number, fallbackX: number, fallbackY: number) => {
       if (points && points[idx]) {
-        return { x: points[idx].x, y: points[idx].y };
+        const pt = points[idx];
+        const nx = pt.x <= 1.0 ? pt.x : pt.x / w;
+        const ny = pt.y <= 1.0 ? pt.y : pt.y / h;
+        return { x: nx * w, y: ny * h };
       }
       return { x: fallbackX * w, y: fallbackY * h };
     };
@@ -167,9 +170,13 @@ export const PhotoFlawInspector: React.FC<PhotoFlawInspectorProps> = ({
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4 text-amber-400" />
+          {flaws.length === 0 ? (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 text-amber-400" />
+          )}
           <span className="text-xs font-mono uppercase tracking-wider text-zinc-300 font-bold">
-            РАЗБОР НЕДОСТАТКОВ НА ФОТО ({flaws.length})
+            {flaws.length === 0 ? 'АНАЛИЗ ЭТАЛОННЫХ ПРОПОРЦИЙ' : `РАЗБОР НЕДОСТАТКОВ НА ФОТО (${flaws.length})`}
           </span>
         </div>
         <span className="text-[10px] font-mono text-zinc-500 uppercase">
@@ -292,59 +299,71 @@ export const PhotoFlawInspector: React.FC<PhotoFlawInspectorProps> = ({
           })}
       </div>
 
-      {/* Selected Flaw Detailed Card */}
-      {selectedFlaw && (
-        <div className="p-4 rounded-2xl bg-zinc-900 border border-zinc-750 space-y-2.5 transition-all">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  selectedFlaw.severity === 'high'
-                    ? 'bg-red-500'
-                    : selectedFlaw.severity === 'medium'
-                    ? 'bg-amber-400'
-                    : 'bg-emerald-400'
-                }`}
-              />
-              <h4 className="text-sm font-bold text-white tracking-tight">
-                {selectedFlaw.title}
-              </h4>
-            </div>
-            <span
-              className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
-                selectedFlaw.severity === 'high'
-                  ? 'border-red-500/50 text-red-300 bg-red-950/40'
-                  : 'border-amber-500/50 text-amber-300 bg-amber-950/40'
-              }`}
-            >
-              {selectedFlaw.severity === 'high' ? 'Критический дефект' : 'Зона роста'}
-            </span>
+      {/* Selected Flaw Detailed Card or Optimal Proportions Card */}
+      {flaws.length === 0 ? (
+        <div className="p-4 rounded-2xl bg-zinc-900/90 border border-emerald-900/40 space-y-2">
+          <div className="flex items-center gap-2 text-emerald-400 font-bold text-xs uppercase font-mono">
+            <CheckCircle2 className="w-4 h-4" />
+            <span>Критических дефектов не обнаружено</span>
           </div>
-
-          <div className="grid grid-cols-2 gap-2 text-xs font-mono py-1">
-            <div className="p-2 rounded-xl bg-zinc-950/60 border border-zinc-800">
-              <span className="text-[10px] text-zinc-500 block">Зафиксировано:</span>
-              <span className="text-white font-bold">{selectedFlaw.valueText}</span>
-            </div>
-            <div className="p-2 rounded-xl bg-zinc-950/60 border border-zinc-800">
-              <span className="text-[10px] text-zinc-500 block">Идеальный эталон:</span>
-              <span className="text-zinc-300 font-bold">{selectedFlaw.idealText}</span>
-            </div>
-          </div>
-
           <p className="text-xs text-zinc-300 leading-relaxed">
-            {selectedFlaw.description}
+            Черты вашего лица обладают высокой билатеральной симметрией, правильным углом наклона глазной щели (Hunter Eyes) и гармоничной геометрией челюсти. Лицо соответствует высшим стандартам эстетической пропорциональности (Chad / True Adam).
           </p>
-
-          {/* Actionable Remedy */}
-          <div className="p-3 rounded-xl bg-black/60 border border-zinc-800 text-xs text-zinc-300 space-y-1">
-            <div className="font-bold text-white flex items-center gap-1.5 text-[11px] uppercase font-mono">
-              <Info className="w-3.5 h-3.5 text-white" />
-              <span>Как исправить и компенсировать:</span>
-            </div>
-            <p className="leading-snug text-zinc-400">{selectedFlaw.howToFix}</p>
-          </div>
         </div>
+      ) : (
+        selectedFlaw && (
+          <div className="p-4 rounded-2xl bg-zinc-900 border border-zinc-750 space-y-2.5 transition-all">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span
+                  className={`w-2 h-2 rounded-full ${
+                    selectedFlaw.severity === 'high'
+                      ? 'bg-red-500'
+                      : selectedFlaw.severity === 'medium'
+                      ? 'bg-amber-400'
+                      : 'bg-emerald-400'
+                  }`}
+                />
+                <h4 className="text-sm font-bold text-white tracking-tight">
+                  {selectedFlaw.title}
+                </h4>
+              </div>
+              <span
+                className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
+                  selectedFlaw.severity === 'high'
+                    ? 'border-red-500/50 text-red-300 bg-red-950/40'
+                    : 'border-amber-500/50 text-amber-300 bg-amber-950/40'
+                }`}
+              >
+                {selectedFlaw.severity === 'high' ? 'Критический дефект' : 'Зона роста'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 text-xs font-mono py-1">
+              <div className="p-2 rounded-xl bg-zinc-950/60 border border-zinc-800">
+                <span className="text-[10px] text-zinc-500 block">Зафиксировано:</span>
+                <span className="text-white font-bold">{selectedFlaw.valueText}</span>
+              </div>
+              <div className="p-2 rounded-xl bg-zinc-950/60 border border-zinc-800">
+                <span className="text-[10px] text-zinc-500 block">Идеальный эталон:</span>
+                <span className="text-zinc-300 font-bold">{selectedFlaw.idealText}</span>
+              </div>
+            </div>
+
+            <p className="text-xs text-zinc-300 leading-relaxed">
+              {selectedFlaw.description}
+            </p>
+
+            {/* Actionable Remedy */}
+            <div className="p-3 rounded-xl bg-black/60 border border-zinc-800 text-xs text-zinc-300 space-y-1">
+              <div className="font-bold text-white flex items-center gap-1.5 text-[11px] uppercase font-mono">
+                <Info className="w-3.5 h-3.5 text-white" />
+                <span>Как исправить и компенсировать:</span>
+              </div>
+              <p className="leading-snug text-zinc-400">{selectedFlaw.howToFix}</p>
+            </div>
+          </div>
+        )
       )}
 
       {/* Flaws Quick List (Clickable to switch pins) */}

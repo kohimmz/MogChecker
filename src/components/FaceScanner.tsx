@@ -45,7 +45,8 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isInitializingCamera, setIsInitializingCamera] = useState(false);
-  
+  const [isProcessingStatic, setIsProcessingStatic] = useState(false);
+
   // Real Head Pose State
   const [headPose, setHeadPose] = useState<HeadPose | null>(null);
   const [faceDetected, setFaceDetected] = useState(false);
@@ -104,38 +105,62 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     let stream: MediaStream | null = null;
 
     if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      // Tier 1: Try front camera (selfie)
+      // Tier 1: Front camera (selfie) with ideal constraints
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user' },
+          video: {
+            facingMode: { ideal: 'user' },
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+          },
           audio: false,
         });
       } catch (err1) {
-        console.warn('Tier 1 facingMode:user failed, trying generic video:true', err1);
-        // Tier 2: Try any available video sensor
+        console.warn('Tier 1 ideal failed, trying facingMode:user string', err1);
         try {
           stream = await navigator.mediaDevices.getUserMedia({
-            video: true,
+            video: { facingMode: 'user' },
             audio: false,
           });
         } catch (err2) {
-          console.warn('Tier 2 generic video failed:', err2);
+          console.warn('Tier 2 facingMode:user failed, trying generic video', err2);
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: false,
+            });
+          } catch (err3) {
+            console.warn('Tier 3 generic video failed:', err3);
+          }
         }
       }
     }
 
-    if (stream && videoRef.current) {
+    const videoEl = videoRef.current;
+    if (stream && videoEl) {
       streamRef.current = stream;
-      videoRef.current.srcObject = stream;
-      videoRef.current.onloadedmetadata = () => {
-        videoRef.current?.play().catch(() => {});
+      videoEl.srcObject = stream;
+      videoEl.setAttribute('playsinline', 'true');
+      videoEl.setAttribute('autoplay', 'true');
+      videoEl.setAttribute('muted', 'true');
+
+      const handlePlay = () => {
         setCameraActive(true);
         setIsInitializingCamera(false);
+      };
+
+      videoEl.onloadedmetadata = () => {
+        const playPromise = videoEl.play();
+        if (playPromise !== undefined) {
+          playPromise.then(handlePlay).catch(handlePlay);
+        } else {
+          handlePlay();
+        }
       };
     } else {
       setIsInitializingCamera(false);
       setCameraActive(false);
-      setCameraError('Не удалось запустить видеопоток с камеры. Вы можете сделать фото через системную камеру или выбрать снимок из галереи.');
+      setCameraError('Прямой видеопоток недоступен на этом устройстве. Вы можете сделать фото через системную камеру или выбрать снимок из галереи.');
     }
   }, []);
 
@@ -220,7 +245,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
         const detection = await faceapi
           .detectSingleFace(
             video,
-            new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.35 })
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.30 })
           )
           .withFaceLandmarks(false);
 
@@ -257,7 +282,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
 
             if (isCurrentPoseMatched && !isTransitioning.current) {
               poseHoldCounter.current += 1;
-              if (poseHoldCounter.current >= 4) {
+              if (poseHoldCounter.current >= 3) {
                 advanceToNextStage(landmarks);
               }
             } else {
@@ -358,7 +383,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     });
   };
 
-  // Tier 3: Native Android Camera Snap
+  // Tier 3: Native Android System Camera Snap
   const handleNativeCameraSnap = async () => {
     try {
       const image = await CapCamera.getPhoto({
@@ -391,54 +416,113 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
     reader.readAsDataURL(file);
   };
 
-  // Process static image with 68 landmarks
+  // Process static image with multi-resolution 68 landmark detection
   const processStaticPhoto = async (dataUrl: string) => {
+    setIsProcessingStatic(true);
     try {
       const img = new Image();
       img.src = dataUrl;
-      await new Promise((resolve) => {
+      await new Promise((resolve, reject) => {
         img.onload = resolve;
+        img.onerror = reject;
       });
 
-      const detection = await faceapi
-        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.25 }))
+      // Memory safe downscaling for mobile devices
+      const maxDim = 1024;
+      let width = img.width;
+      let height = img.height;
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+      }
+
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = width;
+      offCanvas.height = height;
+      const ctx = offCanvas.getContext('2d');
+      if (!ctx) throw new Error('No canvas context');
+      ctx.drawImage(img, 0, 0, width, height);
+
+      // Multi-tier detection for high reliability across various lighting and sizes
+      let detection = await faceapi
+        .detectSingleFace(
+          offCanvas,
+          new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.20 })
+        )
         .withFaceLandmarks(false);
 
-      if (detection) {
-        const offCanvas = document.createElement('canvas');
-        offCanvas.width = img.width;
-        offCanvas.height = img.height;
-        const ctx = offCanvas.getContext('2d');
-        ctx?.drawImage(img, 0, 0);
+      if (!detection) {
+        detection = await faceapi
+          .detectSingleFace(
+            offCanvas,
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.15 })
+          )
+          .withFaceLandmarks(false);
+      }
 
+      if (!detection) {
+        detection = await faceapi
+          .detectSingleFace(
+            offCanvas,
+            new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.15 })
+          )
+          .withFaceLandmarks(false);
+      }
+
+      if (detection) {
         setCapturedPhoto(dataUrl);
         onScanComplete(detection.landmarks, dataUrl, offCanvas);
       } else {
-        alert('Лицо на фото не обнаружено. Пожалуйста, сделайте четкое фото лица с хорошим освещением.');
+        alert('Лицо на фото не обнаружено. Пожалуйста, используйте четкое фото лица анфас при хорошем освещении.');
       }
     } catch (err) {
       console.error('Photo analysis error:', err);
-      alert('Ошибка при анализе фото.');
+      alert('Ошибка при анализе фотографии. Попробуйте другой снимок.');
+    } finally {
+      setIsProcessingStatic(false);
     }
   };
 
-  // Apple Face ID Ticks
+  // Render Apple-style radial ticks
   const renderTicks = () => {
     const ticks = [];
+    const center = 150;
     const radius = 135;
-    const tickLength = 10;
-    const progressTicks = Math.round((scanProgress / 100) * TOTAL_TICKS);
+    const tickLength = 12;
 
     for (let i = 0; i < TOTAL_TICKS; i++) {
-      const angleDeg = (i / TOTAL_TICKS) * 360 - 90;
-      const angleRad = (angleDeg * Math.PI) / 180;
+      const angle = (i * 360) / TOTAL_TICKS - 90;
+      const rad = (angle * Math.PI) / 180;
 
-      const x1 = 150 + Math.cos(angleRad) * (radius - tickLength);
-      const y1 = 150 + Math.sin(angleRad) * (radius - tickLength);
-      const x2 = 150 + Math.cos(angleRad) * radius;
-      const y2 = 150 + Math.sin(angleRad) * radius;
+      const x1 = center + (radius - tickLength) * Math.cos(rad);
+      const y1 = center + (radius - tickLength) * Math.sin(rad);
+      const x2 = center + radius * Math.cos(rad);
+      const y2 = center + radius * Math.sin(rad);
 
-      const isCompleted = i <= progressTicks;
+      let isTickActive = false;
+      const ticksPerStage = TOTAL_TICKS / STAGES.length;
+
+      completedStages.forEach((stageId) => {
+        const stageIdx = STAGES.findIndex((s) => s.id === stageId);
+        const stageStart = stageIdx * ticksPerStage;
+        const stageEnd = stageStart + ticksPerStage;
+        if (i >= stageStart && i < stageEnd) {
+          isTickActive = true;
+        }
+      });
+
+      if (headPose) {
+        const currentStageStart = currentStageIndex * ticksPerStage;
+        const currentStageEnd = currentStageStart + ticksPerStage;
+        if (i >= currentStageStart && i < currentStageEnd) {
+          isTickActive = true;
+        }
+      }
 
       ticks.push(
         <line
@@ -447,10 +531,10 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
           y1={y1}
           x2={x2}
           y2={y2}
-          strokeWidth={isCompleted ? '3' : '1.5'}
-          stroke={isCompleted ? '#ffffff' : '#3f3f46'}
+          stroke={isTickActive ? '#ffffff' : '#27272a'}
+          strokeWidth={isTickActive ? '2.5' : '1.5'}
           strokeLinecap="round"
-          className="transition-all duration-150"
+          className="transition-all duration-200"
         />
       );
     }
@@ -458,23 +542,30 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
   };
 
   return (
-    <div className="min-h-screen flex flex-col justify-between p-6 sm:p-8 bg-black text-white select-none max-w-lg mx-auto relative overflow-hidden">
-      {/* Top Bar */}
-      <div className="pt-2 flex items-center justify-between z-10">
+    <div className="min-h-screen bg-black text-white p-6 flex flex-col justify-between select-none max-w-md mx-auto relative">
+      {/* Processing Static Photo Loading Overlay */}
+      {isProcessingStatic && (
+        <div className="absolute inset-0 bg-black/85 backdrop-blur-md z-50 flex flex-col items-center justify-center p-6 text-center">
+          <Loader2 className="w-12 h-12 text-white animate-spin mb-4" />
+          <h3 className="text-lg font-bold text-white mb-1">Нейросеть вычисляет 68 точек лица</h3>
+          <p className="text-xs text-zinc-400 font-mono">Анализ симметрии, пропорций и углов костной структуры...</p>
+        </div>
+      )}
+
+      {/* Top Header */}
+      <div className="flex items-center justify-between pt-2">
         <button
           onClick={onBack}
-          className="p-2 rounded-xl bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-white transition-colors"
+          className="p-2.5 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-white transition-colors"
         >
-          <ArrowLeft className="w-5 h-5" />
+          <ArrowLeft className="w-4 h-4" />
         </button>
 
-        <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-zinc-900 border border-zinc-800 text-xs font-mono text-zinc-300">
-          <span
-            className={`w-2 h-2 rounded-full ${
-              faceDetected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
-            }`}
-          />
-          <span>{faceDetected ? 'ЛИЦО ЗАХВАЧЕНО' : 'ПОИСК ЛИЦА...'}</span>
+        <div className="flex items-center gap-2">
+          <div className={`w-2 h-2 rounded-full ${faceDetected ? 'bg-emerald-400 animate-ping' : 'bg-white/40'}`} />
+          <span className="text-xs font-mono tracking-widest uppercase text-zinc-300">
+            {faceDetected ? 'ЛИЦО ЗАХВАЧЕНО' : '3D FACE ID SCANNER'}
+          </span>
         </div>
 
         <div className="text-xs font-mono text-zinc-400">
@@ -495,15 +586,16 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({ onScanComplete, onBack
 
           {/* Camera Viewport (Circular cut) */}
           <div className="relative w-[236px] h-[236px] rounded-full overflow-hidden bg-zinc-950 border border-zinc-800 shadow-2xl flex items-center justify-center z-10">
-            {cameraActive ? (
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="w-full h-full object-cover -scale-x-100"
-              />
-            ) : (
+            {/* Always-mounted video element to eliminate chicken-and-egg ref issues */}
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className={`w-full h-full object-cover -scale-x-100 ${cameraActive ? 'block' : 'hidden'}`}
+            />
+
+            {!cameraActive && (
               <div className="w-full h-full flex flex-col items-center justify-center bg-zinc-900 text-zinc-400 p-4 text-center">
                 {!modelsLoaded || isInitializingCamera ? (
                   <>
