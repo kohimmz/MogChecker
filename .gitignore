@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.gradle/
+build/
+android/app/build/
+android/.gradle/
+android/local.properties
+android/app/src/main/assets/public/

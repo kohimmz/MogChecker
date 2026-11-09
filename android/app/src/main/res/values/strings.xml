@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">MogChecker</string>
+    <string name="title_activity_main">MogChecker</string>
+    <string name="package_name">com.kohimmz.mogchecker</string>
+    <string name="custom_url_scheme">com.kohimmz.mogchecker</string>
+</resources>
